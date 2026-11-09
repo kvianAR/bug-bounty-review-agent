@@ -306,7 +306,9 @@ function renderScan(scan) {
     renderMessages(scan.messages || []);
     const title = $('scanProgress').querySelector('strong');
     const detail = $('scanProgress').querySelector('p');
-    title.textContent = scan.error_code === 'repository_access_required' ? 'Repository access required' : scan.status === 'cloning' ? 'Fetching repository' : scan.status === 'reviewing' ? 'Tracing code paths' : scan.status === 'queued' ? 'Preparing review' : 'Review stopped';
+    const errorTitles = { repository_access_required: 'Repository access required', provider_timeout: 'Model response timed out' };
+    const progressTitles = { cloning: 'Fetching repository', reviewing: 'Tracing code paths', queued: 'Preparing review' };
+    title.textContent = errorTitles[scan.error_code] || progressTitles[scan.status] || 'Review stopped';
     detail.textContent = scan.error || (scan.status === 'reviewing' ? 'Codex is reviewing source. This may take several minutes.' : 'Waiting for agent…');
     $('scanProgress').querySelector('.spinner').classList.toggle('hidden', ['failed', 'interrupted'].includes(scan.status));
   }

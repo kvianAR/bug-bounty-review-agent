@@ -50,6 +50,10 @@ class WorkBusy(RuntimeError):
     pass
 
 
+class ProviderTimeoutError(RuntimeError):
+    code = "provider_timeout"
+
+
 @contextmanager
 def model_work(key_alias):
     if not WORK_SLOTS.acquire(blocking=False):
@@ -442,7 +446,6 @@ def custom_completion(model, key_alias, messages, timeout):
                 active_socket.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-        connection.close()
     timer = threading.Timer(timeout, expire)
     timer.daemon = True
     timer.start()
@@ -452,7 +455,7 @@ def custom_completion(model, key_alias, messages, timeout):
             "User-Agent": "TraceRepoReview/0.1"})
         response_socket[0] = connection.sock
         if expired.is_set():
-            raise RuntimeError("Provider request deadline exceeded")
+            raise ProviderTimeoutError("Provider response deadline exceeded after {} seconds. Retry or choose another model.".format(timeout))
         response = connection.getresponse()
         body = response.read(2_000_001)
         if response.status != 200:
@@ -465,10 +468,10 @@ def custom_completion(model, key_alias, messages, timeout):
         except (ValueError, RecursionError) as exc:
             raise RuntimeError("Provider returned malformed JSON") from exc
         if expired.is_set():
-            raise RuntimeError("Provider request deadline exceeded")
+            raise ProviderTimeoutError("Provider response deadline exceeded after {} seconds. Retry or choose another model.".format(timeout))
     except (OSError, http.client.HTTPException) as exc:
-        if expired.is_set():
-            raise RuntimeError("Provider request deadline exceeded") from exc
+        if expired.is_set() or isinstance(exc, TimeoutError):
+            raise ProviderTimeoutError("Provider response deadline exceeded after {} seconds. Retry or choose another model.".format(timeout)) from exc
         raise RuntimeError("Provider connection failed: " + safe_error(str(exc), [key])) from exc
     finally:
         timer.cancel()

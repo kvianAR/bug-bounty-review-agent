@@ -296,9 +296,13 @@ class CoreTests(unittest.TestCase):
         aborted = threading.Event()
         raw_socket = SimpleNamespace(shutdown=lambda how: aborted.set())
         class Connection:
-            def __init__(self): self.sock = raw_socket
+            def __init__(self):
+                self.sock = raw_socket
+                self.close_count = 0
             def request(self, *args, **kwargs): pass
-            def close(self): self.sock = None
+            def close(self):
+                self.close_count += 1
+                self.sock = None
             def getresponse(self):
                 self.sock = None
                 return SimpleNamespace(status=200, read=self.read)
@@ -306,10 +310,12 @@ class CoreTests(unittest.TestCase):
                 if not aborted.wait(1):
                     raise AssertionError("Deadline did not interrupt the response socket")
                 raise OSError("socket closed")
+        connection = Connection()
         with mock.patch.object(server, "validate_endpoint", return_value=("provider.test", 443, "/chat/completions", ["8.8.8.8"])), \
-             mock.patch.object(server, "PublicHTTPSConnection", return_value=Connection()):
+             mock.patch.object(server, "PublicHTTPSConnection", return_value=connection):
             with self.assertRaisesRegex(RuntimeError, "deadline"):
                 server.custom_completion("openrouter|fixture/model", "fixture", [], 0.02)
+        self.assertEqual(1, connection.close_count)
 
     def test_truncated_provider_response_is_controlled(self):
         server.KEYS["fixture"] = "dummy-test-key"
