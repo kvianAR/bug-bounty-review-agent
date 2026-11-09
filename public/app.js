@@ -4,6 +4,8 @@ let pollTimer = null;
 let toastTimer = null;
 let savedModels = [];
 let savedKeys = [];
+let savedProviders = [];
+let catalogTimer = null;
 
 async function api(path, options = {}) {
   const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
@@ -31,17 +33,58 @@ function node(tag, className, value) {
   return el;
 }
 
+function modelLabel(model) {
+  if (model.startsWith('openrouter|')) return `OpenRouter · ${model.slice(11)}`;
+  if (model.startsWith('custom|')) {
+    const [, provider, id] = model.split('|');
+    return `${provider} · ${id}`;
+  }
+  return `Codex · ${model}`;
+}
+
+function requiresKey(model) { return model.startsWith('openrouter|') || model.startsWith('custom|'); }
+
 function renderModels() {
   for (const id of ['scanModel', 'chatModel']) {
     const select = $(id);
     const previous = select.value;
     select.replaceChildren(new Option('Codex default', ''));
-    for (const model of savedModels) select.add(new Option(model.startsWith('openrouter|') ? `OpenRouter · ${model.slice(11)}` : `Codex · ${model}`, model));
+    for (const model of savedModels) select.add(new Option(modelLabel(model), model));
     select.value = savedModels.includes(previous) ? previous : '';
   }
   const list = $('savedModels');
   list.replaceChildren();
-  for (const model of savedModels) list.append(node('span', '', model.startsWith('openrouter|') ? `OpenRouter · ${model.slice(11)}` : `Codex · ${model}`));
+  for (const model of savedModels) {
+    const badge = node('span', 'model-badge');
+    badge.append(node('span', '', modelLabel(model)));
+    const test = node('button', 'test-model', 'Test');
+    test.type = 'button';
+    test.setAttribute('aria-label', `Test ${model}`);
+    test.addEventListener('click', async () => {
+      const keyAlias = $('testKey').value;
+      if (requiresKey(model) && !keyAlias) return toast('Select a key for this model test');
+      $('modelTestResult').textContent = `Testing ${modelLabel(model)}…`;
+      test.disabled = true;
+      try {
+        const result = await api('/api/models/test', { method: 'POST', body: JSON.stringify({ model, key_alias: keyAlias }) });
+        $('modelTestResult').textContent = `Working: ${result.answer}`;
+      } catch (error) { $('modelTestResult').textContent = `Failed: ${error.message}`; }
+      finally { test.disabled = false; }
+    });
+    const remove = node('button', '', '×');
+    remove.type = 'button';
+    remove.setAttribute('aria-label', `Delete ${model}`);
+    remove.addEventListener('click', async () => {
+      try {
+        const data = await api('/api/models', { method: 'DELETE', body: JSON.stringify({ model }) });
+        savedModels = data.models;
+        renderModels();
+        toast(`Model ${model} deleted`);
+      } catch (error) { toast(error.message); }
+    });
+    badge.append(test, remove);
+    list.append(badge);
+  }
   updateKeyRows();
 }
 
@@ -52,7 +95,7 @@ async function loadModels() {
 }
 
 function renderKeys() {
-  for (const id of ['scanKey', 'chatKey']) {
+  for (const id of ['scanKey', 'chatKey', 'testKey']) {
     const select = $(id);
     const previous = select.value;
     select.replaceChildren(new Option('Select key', ''));
@@ -61,7 +104,23 @@ function renderKeys() {
   }
   const list = $('savedKeys');
   list.replaceChildren();
-  for (const alias of savedKeys) list.append(node('span', '', alias));
+  for (const alias of savedKeys) {
+    const badge = node('span', 'model-badge');
+    badge.append(node('span', '', alias));
+    const remove = node('button', '', '×');
+    remove.type = 'button';
+    remove.setAttribute('aria-label', `Delete key ${alias}`);
+    remove.addEventListener('click', async () => {
+      try {
+        const data = await api('/api/keys', { method: 'DELETE', body: JSON.stringify({ alias }) });
+        savedKeys = data.keys;
+        renderKeys();
+        toast(`Key ${alias} deleted`);
+      } catch (error) { toast(error.message); }
+    });
+    badge.append(remove);
+    list.append(badge);
+  }
 }
 
 async function loadKeys() {
@@ -70,9 +129,45 @@ async function loadKeys() {
   renderKeys();
 }
 
+function renderProviders() {
+  const select = $('customProvider');
+  const previous = select.value;
+  select.replaceChildren(new Option('Select provider', ''));
+  const list = $('savedProviders');
+  list.replaceChildren();
+  for (const provider of savedProviders) {
+    select.add(new Option(provider.name, provider.name));
+    list.append(node('span', '', provider.name));
+  }
+  select.value = savedProviders.some((provider) => provider.name === previous) ? previous : '';
+}
+
+async function loadProviders() {
+  const data = await api('/api/providers');
+  savedProviders = data.providers;
+  renderProviders();
+}
+
+async function searchCatalog(query) {
+  const list = $('catalogResults');
+  if (!query.trim()) { list.replaceChildren(); return; }
+  try {
+    const data = await api(`/api/openrouter/models?q=${encodeURIComponent(query.trim())}`);
+    if ($('catalogSearch').value.trim() !== query.trim()) return;
+    list.replaceChildren();
+    for (const model of data.models.slice(0, 8)) {
+      const button = node('button', '', `${model.name} · ${model.id}`);
+      button.type = 'button';
+      button.addEventListener('click', () => { $('modelId').value = model.id; list.replaceChildren(); });
+      list.append(button);
+    }
+    if (!data.models.length) list.append(node('small', '', 'No matching model. You can paste an ID directly.'));
+  } catch (error) { list.replaceChildren(node('small', '', error.message)); }
+}
+
 function updateKeyRows() {
-  $('scanKeyRow').classList.toggle('hidden', !$('scanModel').value.startsWith('openrouter|'));
-  $('chatKeyRow').classList.toggle('hidden', !$('chatModel').value.startsWith('openrouter|'));
+  $('scanKeyRow').classList.toggle('hidden', !requiresKey($('scanModel').value));
+  $('chatKeyRow').classList.toggle('hidden', !requiresKey($('chatModel').value));
 }
 
 function showWelcome() {
@@ -140,7 +235,7 @@ function renderMessages(messages) {
     const row = node('div', message.role === 'user' ? 'user-message' : 'assistant-message');
     if (message.role !== 'user') row.append(node('div', 'avatar', 'T'));
     const body = node('div', 'message-body');
-    if (message.role !== 'user') body.append(node('small', '', `TRACE AGENT · ${(message.model || 'Codex default').replace('openrouter|', 'OpenRouter · ')}`));
+    if (message.role !== 'user') body.append(node('small', '', `TRACE AGENT · ${message.model ? modelLabel(message.model) : 'Codex default'}`));
     body.append(node('p', '', message.content));
     row.append(body);
     container.append(row);
@@ -155,7 +250,7 @@ function renderScan(scan) {
   $('repoName').textContent = repoName(scan.url);
   $('repoLink').href = scan.url;
   $('statusPill').textContent = scan.status;
-  $('statusPill').title = `Scan model: ${(scan.model || 'Codex default').replace('openrouter|', 'OpenRouter · ')}`;
+  $('statusPill').title = `Scan model: ${scan.model ? modelLabel(scan.model) : 'Codex default'}`;
   $('statusPill').className = `status-pill ${scan.status}`;
   const done = scan.status === 'complete';
   $('chatInput').disabled = !done;
@@ -236,8 +331,24 @@ $('scanModel').addEventListener('change', updateKeyRows);
 $('chatModel').addEventListener('change', updateKeyRows);
 $('modelProvider').addEventListener('change', () => {
   const openrouter = $('modelProvider').value === 'openrouter';
+  const custom = $('modelProvider').value === 'custom';
   $('floorLabel').classList.toggle('hidden', !openrouter);
-  $('modelId').placeholder = openrouter ? 'e.g. anthropic/claude-sonnet-4.5' : 'e.g. gpt-6.1-sol';
+  $('catalogRow').classList.toggle('hidden', !openrouter);
+  $('customModelRow').classList.toggle('hidden', !custom);
+  $('modelId').placeholder = openrouter ? 'Paste provider/model:free or provider/model:floor' : custom ? 'Provider model ID' : 'e.g. gpt-6.1-sol';
+});
+$('catalogSearch').addEventListener('input', () => {
+  clearTimeout(catalogTimer);
+  const query = $('catalogSearch').value;
+  catalogTimer = setTimeout(() => searchCatalog(query), 250);
+});
+$('deepseekPreset').addEventListener('click', () => {
+  $('providerName').value = 'DeepSeek';
+  $('providerEndpoint').value = 'https://api.deepseek.com/chat/completions';
+});
+$('mimoPreset').addEventListener('click', () => {
+  $('providerName').value = 'MiMo';
+  $('providerEndpoint').value = 'https://api.xiaomimimo.com/v1/chat/completions';
 });
 $('manageModels').addEventListener('click', () => $('modelDialog').showModal());
 $('addModelInline').addEventListener('click', () => $('modelDialog').showModal());
@@ -248,17 +359,34 @@ $('modelForm').addEventListener('submit', async (event) => {
   try {
     const provider = $('modelProvider').value;
     let model = $('modelId').value.trim();
-    if (provider === 'openrouter' && $('floorMode').checked && !model.endsWith(':floor')) model += ':floor';
-    const data = await api('/api/models', { method: 'POST', body: JSON.stringify({ id: model, provider }) });
+    if (provider === 'openrouter' && $('floorMode').checked && !/:(floor|free|nitro)$/.test(model)) model += ':floor';
+    const providerName = $('customProvider').value;
+    const data = await api('/api/models', { method: 'POST', body: JSON.stringify({ id: model, provider, provider_name: providerName }) });
     savedModels = data.models;
     renderModels();
-    const selected = provider === 'openrouter' ? `openrouter|${model}` : model;
+    const selected = provider === 'openrouter' ? `openrouter|${model}` : provider === 'custom' ? `custom|${providerName}|${model}` : model;
     $('scanModel').value = selected;
     $('chatModel').value = selected;
     updateKeyRows();
     $('modelId').value = '';
     $('floorMode').checked = false;
     toast(`Model ${model} saved`);
+  } catch (error) { toast(error.message); }
+});
+$('providerForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    const name = $('providerName').value.trim();
+    const endpoint = $('providerEndpoint').value.trim();
+    const data = await api('/api/providers', { method: 'POST', body: JSON.stringify({ name, endpoint }) });
+    savedProviders = data.providers;
+    renderProviders();
+    $('modelProvider').value = 'custom';
+    $('modelProvider').dispatchEvent(new Event('change'));
+    $('customProvider').value = name;
+    $('providerName').value = '';
+    $('providerEndpoint').value = '';
+    toast(`Provider ${name} saved`);
   } catch (error) { toast(error.message); }
 });
 $('keyForm').addEventListener('submit', async (event) => {
@@ -270,6 +398,7 @@ $('keyForm').addEventListener('submit', async (event) => {
     renderKeys();
     $('scanKey').value = alias;
     $('chatKey').value = alias;
+    $('testKey').value = alias;
     $('keyAlias').value = '';
     $('apiKey').value = '';
     toast(`Key ${alias} added for this session`);
@@ -281,3 +410,4 @@ document.addEventListener('keydown', (event) => {
 loadHistory().catch((error) => toast(error.message));
 loadModels().catch((error) => toast(error.message));
 loadKeys().catch((error) => toast(error.message));
+loadProviders().catch((error) => toast(error.message));

@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 import server
 from bugbounty_agent import validate_findings
@@ -30,15 +31,35 @@ class CoreTests(unittest.TestCase):
                                  {"path": "app.py", "line": 2}]}
             self.assertEqual(1, len(validate_findings(data, repo)["findings"]))
 
-    def test_openrouter_key_is_only_in_process_environment(self):
+    def test_openrouter_free_id_and_key_reach_chat_api(self):
         server.KEYS["test"] = "sk-or-private-test-value"
-        args, env = server.model_options("openrouter|vendor/model:floor", "test")
-        self.assertIn("vendor/model:floor", args)
-        self.assertEqual("sk-or-private-test-value", env["OPENROUTER_API_KEY"])
-        self.assertNotIn("sk-or-private-test-value", " ".join(args))
-        with self.assertRaises(ValueError):
-            server.model_options("openrouter|vendor/model:floor", "missing")
+        class Reply:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, size):
+                return b'{"choices":[{"message":{"content":"TRACE_MODEL_OK"}}]}'
+        class Opener:
+            def open(self, request, timeout):
+                self_url = request.full_url
+                self.assertTrue(self_url.endswith("/chat/completions"))
+                self.assertEqual("nvidia/nemotron-3-ultra-550b-a55b:free", json.loads(request.data)["model"])
+                self.assertEqual("Bearer sk-or-private-test-value", request.get_header("Authorization"))
+                return Reply()
+        opener = Opener()
+        opener.assertTrue = self.assertTrue
+        opener.assertEqual = self.assertEqual
+        with mock.patch.object(server, "validate_endpoint"), mock.patch.object(server.urllib.request, "build_opener", return_value=opener):
+            answer = server.custom_completion("openrouter|nvidia/nemotron-3-ultra-550b-a55b:free", "test",
+                                              [{"role": "user", "content": "test"}], 10)
+        self.assertEqual("TRACE_MODEL_OK", answer)
+        self.assertNotIn("sk-or-private-test-value", json.dumps(server.MODELS))
         server.KEYS.clear()
+
+    def test_report_parser_rejects_non_json(self):
+        with self.assertRaises(RuntimeError):
+            server.parse_report("not a report")
+        report = server.parse_report('```json\n{"summary":"ok","findings":[],"limitations":[]}\n```')
+        self.assertEqual([], report["findings"])
 
     def test_api_requires_private_access_link(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -64,6 +85,15 @@ class CoreTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as cross_origin:
                     client.open(request)
                 self.assertEqual(403, cross_origin.exception.code)
+                server.KEYS["delete-me"] = "test-key-value"
+                delete = urllib.request.Request(base + "/api/keys", data=b'{"alias":"delete-me"}',
+                    headers={"Content-Type": "application/json"}, method="DELETE")
+                with mock.patch.object(server, "delete_key", side_effect=lambda alias: server.KEYS.pop(alias)):
+                    self.assertNotIn("delete-me", json.load(client.open(delete))["keys"])
+                server.MODELS.append("temporary-model")
+                remove_model = urllib.request.Request(base + "/api/models", data=b'{"model":"temporary-model"}',
+                    headers={"Content-Type": "application/json"}, method="DELETE")
+                self.assertNotIn("temporary-model", json.load(client.open(remove_model))["models"])
             finally:
                 httpd.shutdown()
                 httpd.server_close()
