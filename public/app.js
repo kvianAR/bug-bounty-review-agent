@@ -2,6 +2,8 @@ const $ = (id) => document.getElementById(id);
 let currentId = null;
 let pollTimer = null;
 let toastTimer = null;
+let savedModels = [];
+let savedKeys = [];
 
 async function api(path, options = {}) {
   const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
@@ -27,6 +29,50 @@ function node(tag, className, value) {
   if (className) el.className = className;
   if (value !== undefined) el.textContent = value;
   return el;
+}
+
+function renderModels() {
+  for (const id of ['scanModel', 'chatModel']) {
+    const select = $(id);
+    const previous = select.value;
+    select.replaceChildren(new Option('Codex default', ''));
+    for (const model of savedModels) select.add(new Option(model.startsWith('openrouter|') ? `OpenRouter · ${model.slice(11)}` : `Codex · ${model}`, model));
+    select.value = savedModels.includes(previous) ? previous : '';
+  }
+  const list = $('savedModels');
+  list.replaceChildren();
+  for (const model of savedModels) list.append(node('span', '', model.startsWith('openrouter|') ? `OpenRouter · ${model.slice(11)}` : `Codex · ${model}`));
+  updateKeyRows();
+}
+
+async function loadModels() {
+  const data = await api('/api/models');
+  savedModels = data.models;
+  renderModels();
+}
+
+function renderKeys() {
+  for (const id of ['scanKey', 'chatKey']) {
+    const select = $(id);
+    const previous = select.value;
+    select.replaceChildren(new Option('Select key', ''));
+    for (const alias of savedKeys) select.add(new Option(alias, alias));
+    select.value = savedKeys.includes(previous) ? previous : '';
+  }
+  const list = $('savedKeys');
+  list.replaceChildren();
+  for (const alias of savedKeys) list.append(node('span', '', alias));
+}
+
+async function loadKeys() {
+  const data = await api('/api/keys');
+  savedKeys = data.keys;
+  renderKeys();
+}
+
+function updateKeyRows() {
+  $('scanKeyRow').classList.toggle('hidden', !$('scanModel').value.startsWith('openrouter|'));
+  $('chatKeyRow').classList.toggle('hidden', !$('chatModel').value.startsWith('openrouter|'));
 }
 
 function showWelcome() {
@@ -94,7 +140,7 @@ function renderMessages(messages) {
     const row = node('div', message.role === 'user' ? 'user-message' : 'assistant-message');
     if (message.role !== 'user') row.append(node('div', 'avatar', 'T'));
     const body = node('div', 'message-body');
-    if (message.role !== 'user') body.append(node('small', '', 'TRACE AGENT'));
+    if (message.role !== 'user') body.append(node('small', '', `TRACE AGENT · ${(message.model || 'Codex default').replace('openrouter|', 'OpenRouter · ')}`));
     body.append(node('p', '', message.content));
     row.append(body);
     container.append(row);
@@ -109,6 +155,7 @@ function renderScan(scan) {
   $('repoName').textContent = repoName(scan.url);
   $('repoLink').href = scan.url;
   $('statusPill').textContent = scan.status;
+  $('statusPill').title = `Scan model: ${(scan.model || 'Codex default').replace('openrouter|', 'OpenRouter · ')}`;
   $('statusPill').className = `status-pill ${scan.status}`;
   const done = scan.status === 'complete';
   $('chatInput').disabled = !done;
@@ -156,7 +203,7 @@ $('scanForm').addEventListener('submit', async (event) => {
   button.disabled = true;
   button.textContent = 'Starting…';
   try {
-    const scan = await api('/api/scans', { method: 'POST', body: JSON.stringify({ url: $('repoUrl').value.trim(), focus: $('focus').value.trim() }) });
+    const scan = await api('/api/scans', { method: 'POST', body: JSON.stringify({ url: $('repoUrl').value.trim(), focus: $('focus').value.trim(), model: $('scanModel').value, key_alias: $('scanKey').value }) });
     await openScan(scan.id);
   } catch (error) { toast(error.message); }
   finally { button.disabled = false; button.innerHTML = 'Start scan <span>→</span>'; }
@@ -175,7 +222,7 @@ $('chatForm').addEventListener('submit', async (event) => {
   try {
     const scan = await api(`/api/scans/${id}`);
     renderMessages([...(scan.messages || []), { role: 'user', content: question }, thinking]);
-    const result = await api(`/api/scans/${id}/chat`, { method: 'POST', body: JSON.stringify({ message: question }) });
+    const result = await api(`/api/scans/${id}/chat`, { method: 'POST', body: JSON.stringify({ message: question, model: $('chatModel').value, key_alias: $('chatKey').value }) });
     if (currentId === id) renderMessages(result.messages);
   } catch (error) { toast(error.message); $('chatInput').value = question; }
   finally { if (currentId === id) { $('chatInput').disabled = false; $('sendChat').disabled = false; $('chatInput').focus(); } }
@@ -185,7 +232,52 @@ $('chatInput').addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('chatForm').requestSubmit(); }
 });
 $('newScan').addEventListener('click', showWelcome);
+$('scanModel').addEventListener('change', updateKeyRows);
+$('chatModel').addEventListener('change', updateKeyRows);
+$('modelProvider').addEventListener('change', () => {
+  const openrouter = $('modelProvider').value === 'openrouter';
+  $('floorLabel').classList.toggle('hidden', !openrouter);
+  $('modelId').placeholder = openrouter ? 'e.g. anthropic/claude-sonnet-4.5' : 'e.g. gpt-6.1-sol';
+});
+$('manageModels').addEventListener('click', () => $('modelDialog').showModal());
+$('addModelInline').addEventListener('click', () => $('modelDialog').showModal());
+$('closeModels').addEventListener('click', () => $('modelDialog').close());
+$('cancelModels').addEventListener('click', () => $('modelDialog').close());
+$('modelForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    const provider = $('modelProvider').value;
+    let model = $('modelId').value.trim();
+    if (provider === 'openrouter' && $('floorMode').checked && !model.endsWith(':floor')) model += ':floor';
+    const data = await api('/api/models', { method: 'POST', body: JSON.stringify({ id: model, provider }) });
+    savedModels = data.models;
+    renderModels();
+    const selected = provider === 'openrouter' ? `openrouter|${model}` : model;
+    $('scanModel').value = selected;
+    $('chatModel').value = selected;
+    updateKeyRows();
+    $('modelId').value = '';
+    $('floorMode').checked = false;
+    toast(`Model ${model} saved`);
+  } catch (error) { toast(error.message); }
+});
+$('keyForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    const alias = $('keyAlias').value.trim();
+    const data = await api('/api/keys', { method: 'POST', body: JSON.stringify({ alias, key: $('apiKey').value.trim() }) });
+    savedKeys = data.keys;
+    renderKeys();
+    $('scanKey').value = alias;
+    $('chatKey').value = alias;
+    $('keyAlias').value = '';
+    $('apiKey').value = '';
+    toast(`Key ${alias} added for this session`);
+  } catch (error) { toast(error.message); }
+});
 document.addEventListener('keydown', (event) => {
   if (event.key.toLowerCase() === 'n' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) showWelcome();
 });
 loadHistory().catch((error) => toast(error.message));
+loadModels().catch((error) => toast(error.message));
+loadKeys().catch((error) => toast(error.message));

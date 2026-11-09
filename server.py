@@ -3,11 +3,14 @@
 
 import json
 import os
+import re
+import secrets
 import subprocess
 import threading
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -19,8 +22,11 @@ PUBLIC = ROOT / "public"
 DATA = Path(os.environ.get("BUGBOUNTY_DATA_DIR", ROOT / "data")).resolve()
 HOST = os.environ.get("BUGBOUNTY_HOST", "127.0.0.1")
 PORT = int(os.environ.get("BUGBOUNTY_PORT", "8791"))
+SESSION_TOKEN = os.environ.get("BUGBOUNTY_TOKEN") or secrets.token_urlsafe(32)
 MAX_BODY = 16_384
 JOBS = {}
+MODELS = []
+KEYS = {}
 LOCK = threading.Lock()
 
 
@@ -42,6 +48,12 @@ def visible(job):
 
 def load_jobs():
     DATA.mkdir(parents=True, exist_ok=True)
+    model_file = DATA / "models.json"
+    if model_file.exists():
+        try:
+            MODELS.extend(json.loads(model_file.read_text()))
+        except (OSError, ValueError):
+            pass
     for file in DATA.glob("*/job.json"):
         try:
             job = json.loads(file.read_text())
@@ -71,11 +83,12 @@ def run_scan(job_id):
             save(job)
         focus = job["focus"][:250]
         prompt = PROMPT.format(repo=repo, focus=focus)
-        result = subprocess.run(
-            ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
-             "--output-schema", str(schema), "--output-last-message", str(response),
-             "-C", str(repo), prompt], capture_output=True, text=True, timeout=3600,
-        )
+        command = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
+                   "--output-schema", str(schema), "--output-last-message", str(response),
+                   "-C", str(repo)]
+        model_args, model_env = model_options(job["model"], job.get("key_alias", ""))
+        result = subprocess.run(command + model_args + [prompt], env=model_env,
+                                capture_output=True, text=True, timeout=3600)
         if result.returncode:
             raise RuntimeError("Codex review failed: " + result.stderr.strip()[-500:])
         report = validate_findings(json.loads(response.read_text()), repo)
@@ -98,7 +111,7 @@ def run_scan(job_id):
             save(job)
 
 
-def run_chat(job, question):
+def run_chat(job, question, model):
     folder = DATA / job["id"]
     response = folder / ("chat-" + uuid.uuid4().hex + ".txt")
     history = job.get("messages", [])[-8:]
@@ -110,11 +123,11 @@ insufficient. Do not claim a vulnerability is confirmed without local reproducti
 
 Report JSON:\n{report}\n\nRecent chat:\n{history}\n\nUser question:\n{question}
 """.format(report=json.dumps(job["report"])[:30000], history=context, question=question)
-    result = subprocess.run(
-        ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
-         "--output-last-message", str(response), "-C", job["repo_path"], prompt],
-        capture_output=True, text=True, timeout=600,
-    )
+    command = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
+               "--output-last-message", str(response), "-C", job["repo_path"]]
+    model_args, model_env = model_options(model, job.get("active_key_alias", ""))
+    result = subprocess.run(command + model_args + [prompt], env=model_env,
+                            capture_output=True, text=True, timeout=600)
     if result.returncode:
         raise RuntimeError("Chat failed: " + result.stderr.strip()[-500:])
     answer = response.read_text().strip()
@@ -122,10 +135,43 @@ Report JSON:\n{report}\n\nRecent chat:\n{history}\n\nUser question:\n{question}
     return answer
 
 
+def model_options(model, key_alias):
+    env = os.environ.copy()
+    if model.startswith("openrouter|"):
+        with LOCK:
+            key = KEYS.get(key_alias)
+        if not key:
+            raise ValueError("Add or select an OpenRouter API key")
+        env["OPENROUTER_API_KEY"] = key
+        model_id = model.split("|", 1)[1]
+        return ["-m", model_id,
+                "-c", 'model_provider="openrouter"',
+                "-c", 'model_providers.openrouter.name="OpenRouter"',
+                "-c", 'model_providers.openrouter.base_url="https://openrouter.ai/api/v1"',
+                "-c", 'model_providers.openrouter.wire_api="responses"',
+                "-c", 'model_providers.openrouter.env_key="OPENROUTER_API_KEY"',
+                "-c", 'model_providers.openrouter.request_max_retries=1',
+                "-c", 'model_providers.openrouter.stream_max_retries=1'], env
+    return (["-m", model] if model else []), env
+
+
 class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # The bootstrap URL contains a secret. Do not log request paths.
+        pass
+
     def trusted_request(self):
         host = self.headers.get("Host", "").split(":", 1)[0].lower()
         return host in {"127.0.0.1", "localhost"}
+
+    def authenticated(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+            token = cookie.get("trace_session")
+            return bool(token and secrets.compare_digest(token.value, SESSION_TOKEN))
+        except Exception:
+            return False
 
     def send_json(self, code, value):
         body = json.dumps(value).encode()
@@ -148,9 +194,29 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.trusted_request():
             return self.send_json(403, {"error": "Local host required"})
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/" and parsed.query.startswith("token="):
+            token = parsed.query[6:]
+            if secrets.compare_digest(token, SESSION_TOKEN):
+                self.send_response(302)
+                self.send_header("Set-Cookie", "trace_session={}; HttpOnly; SameSite=Strict; Path=/".format(SESSION_TOKEN))
+                self.send_header("Location", "/")
+                self.end_headers()
+                return
+            return self.send_json(403, {"error": "Invalid access link"})
+        if path.startswith("/api/") and not self.authenticated():
+            return self.send_json(401, {"error": "Open the private access link printed when the server starts"})
         if path == "/api/health":
             return self.send_json(200, {"ok": True})
+        if path == "/api/models":
+            with LOCK:
+                models = list(MODELS)
+            return self.send_json(200, {"models": models})
+        if path == "/api/keys":
+            with LOCK:
+                aliases = sorted(KEYS)
+            return self.send_json(200, {"keys": aliases})
         if path == "/api/scans":
             with LOCK:
                 items = [visible(j) for j in JOBS.values()]
@@ -188,6 +254,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.trusted_request():
             return self.send_json(403, {"error": "Local host required"})
+        if not self.authenticated():
+            return self.send_json(401, {"error": "Open the private access link printed when the server starts"})
         origin = self.headers.get("Origin")
         if origin and origin not in {"http://127.0.0.1:{}".format(PORT), "http://localhost:{}".format(PORT)}:
             return self.send_json(403, {"error": "Cross-origin request blocked"})
@@ -196,12 +264,49 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             data = self.body_json()
+            if path == "/api/models":
+                model = str(data.get("id", "")).strip()
+                provider = str(data.get("provider", "codex")).strip()
+                if provider not in {"codex", "openrouter"}:
+                    raise ValueError("Choose Codex or OpenRouter")
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}", model):
+                    raise ValueError("Model ID must be 1 to 100 letters, numbers, or . _ : / -")
+                if provider == "openrouter":
+                    if "/" not in model:
+                        raise ValueError("OpenRouter model ID needs provider/model format")
+                    model = "openrouter|" + model
+                with LOCK:
+                    if model not in MODELS:
+                        MODELS.append(model)
+                        temp = DATA / "models.tmp"
+                        temp.write_text(json.dumps(MODELS, indent=2) + "\n")
+                        temp.replace(DATA / "models.json")
+                return self.send_json(201, {"models": list(MODELS)})
+            if path == "/api/keys":
+                alias = str(data.get("alias", "")).strip()
+                key = str(data.get("key", "")).strip()
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}", alias):
+                    raise ValueError("Key name must be 1 to 40 characters")
+                if not key.startswith("sk-or-") or len(key) < 15 or len(key) > 500:
+                    raise ValueError("Enter a valid OpenRouter API key")
+                with LOCK:
+                    KEYS[alias] = key
+                    aliases = sorted(KEYS)
+                return self.send_json(201, {"keys": aliases})
             if path == "/api/scans":
                 url = str(data.get("url", "")).strip()
                 resolve_repo_url(url)
                 focus = str(data.get("focus", "all security-relevant code")).strip()[:250]
+                model = str(data.get("model", "")).strip()
+                key_alias = str(data.get("key_alias", "")).strip()
+                with LOCK:
+                    if model and model not in MODELS:
+                        raise ValueError("Select a saved model")
+                    if model.startswith("openrouter|") and key_alias not in KEYS:
+                        raise ValueError("Select an OpenRouter API key")
                 job_id = uuid.uuid4().hex[:12]
-                job = {"id": job_id, "url": url, "focus": focus,
+                job = {"id": job_id, "url": url, "focus": focus, "model": model,
+                       "key_alias": key_alias if model.startswith("openrouter|") else "",
                        "status": "queued", "created_at": now(), "updated_at": now(),
                        "messages": []}
                 with LOCK:
@@ -214,16 +319,23 @@ class Handler(BaseHTTPRequestHandler):
                 question = str(data.get("message", "")).strip()
                 if not question or len(question) > 4000:
                     raise ValueError("Message must be 1 to 4000 characters")
+                model = str(data.get("model", "")).strip()
+                key_alias = str(data.get("key_alias", "")).strip()
                 with LOCK:
+                    if model and model not in MODELS:
+                        raise ValueError("Select a saved model")
+                    if model.startswith("openrouter|") and key_alias not in KEYS:
+                        raise ValueError("Select an OpenRouter API key")
                     job = JOBS.get(parts[2])
                     if not job:
                         return self.send_json(404, {"error": "Scan not found"})
                     if job["status"] != "complete":
                         return self.send_json(409, {"error": "Wait for scan to finish"})
-                answer = run_chat(job, question)
+                chat_job = dict(job, active_key_alias=key_alias)
+                answer = run_chat(chat_job, question, model)
                 with LOCK:
-                    job["messages"].extend([{"role": "user", "content": question},
-                                            {"role": "assistant", "content": answer}])
+                    job["messages"].extend([{"role": "user", "content": question, "model": model},
+                                            {"role": "assistant", "content": answer, "model": model}])
                     job["updated_at"] = now()
                     save(job)
                 return self.send_json(200, {"answer": answer, "messages": job["messages"]})
@@ -247,5 +359,5 @@ def resolve_repo_url(url):
 
 if __name__ == "__main__":
     load_jobs()
-    print("Bug bounty review app: http://{}:{}".format(HOST, PORT), flush=True)
+    print("Open private app link: http://{}:{}/?token={}".format(HOST, PORT, SESSION_TOKEN), flush=True)
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
