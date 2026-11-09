@@ -12,3 +12,60 @@
 .model-badge button.test-model{font:10px 'DM Mono',monospace;color:var(--accent);padding:2px 5px;border:1px solid #476a4e;border-radius:3px}.model-badge button.test-model:disabled{opacity:.5}.catalog-results{max-height:150px;overflow-y:auto;margin-top:7px;display:flex;flex-direction:column;gap:3px}.catalog-results button{background:#1b2a2b;border:1px solid var(--line);color:#c9d8d0;border-radius:4px;padding:7px;text-align:left;font-size:10px}.catalog-results button:hover{border-color:var(--accent)}.catalog-results small{color:var(--muted);font-size:10px}.test-controls{border-top:1px solid var(--line);padding-top:15px;margin-top:14px}.test-controls #modelTestResult{color:var(--muted);font-size:11px;line-height:1.5;overflow-wrap:anywhere;margin-top:9px}.preset-row{display:flex;gap:7px;margin-bottom:13px}.preset-row button{background:#24372c;border:1px solid #426047;color:var(--accent);border-radius:4px;padding:7px 10px;font:10px 'DM Mono',monospace}#customModelRow,#catalogRow{margin-top:14px}#customModelRow label,#catalogRow label{display:block;margin-bottom:7px}
 .retry-scan{margin-top:12px;background:#24372c;border:1px solid #426047;color:var(--accent);border-radius:5px;padding:10px 13px;font-size:12px}.retry-scan:hover{background:#2d4836}
 .access-note{color:var(--muted);font-size:11px;line-height:1.6;margin:9px 0 22px}.workspace-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}.delete-scan{border:1px solid #6b4542;color:#edb2a7;border-radius:5px;background:transparent;padding:8px 10px;font-size:10px}.delete-scan:hover{background:#3b2826}.delete-scan:disabled{opacity:.4;cursor:not-allowed}
+
+.advanced-scan { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 16px; }
+.advanced-scan summary, .insight-panel > summary { color: var(--accent); cursor: pointer; font-size: 12px; }
+.advanced-scan[open] > summary { margin-bottom: 20px; }
+.advanced-scan select, .advanced-scan input, .review-settings select, .finding-workflow-section select,
+.finding-workflow-section input, .finding-workflow-section textarea, #budgetForm select, #budgetForm input {
+  width: 100%; background: #0c1416; border: 1px solid #35413f; border-radius: 6px; color: var(--text);
+  padding: 10px 11px; font-size: 11px; outline: none;
+}
+.advanced-scan input:focus, .finding-workflow-section textarea:focus, .finding-workflow-section input:focus { border-color: var(--accent); }
+.field-help { color: var(--muted); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.policy-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.policy-grid label, .review-settings label, .finding-workflow-section label, #budgetForm label {
+  display: block; color: #becdc5; font-size: 10px; margin: 12px 0 7px; line-height: 1.4;
+}
+.fallback-grid { display: grid; gap: 8px; }
+.fallback-grid > div { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 8px; }
+.workflow-overview { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 18px; }
+.overview-chip { font: 10px 'DM Mono', monospace; color: #acc2b7; border: 1px solid #354b3e; border-radius: 4px; padding: 7px 9px; }
+.operation-status { border: 1px solid #6a5940; border-radius: 7px; background: #2b271d; color: #e2cfaa; padding: 13px 16px; margin-bottom: 14px; font-size: 12px; overflow-wrap: anywhere; }
+.review-settings { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 13px; align-items: end; margin-bottom: 18px; }
+.review-settings .show-dismissed { display: flex; align-items: center; gap: 7px; margin-bottom: 11px; white-space: nowrap; color: var(--muted); }
+.show-dismissed input { accent-color: var(--accent); }
+.insight-panel { border: 1px solid var(--line); border-radius: 8px; padding: 14px 17px; background: var(--panel); margin-bottom: 12px; }
+.insight-panel[open] > summary { margin-bottom: 15px; }
+.insight-panel p { font-size: 12px; }
+.table-scroll { max-height: 280px; overflow: auto; margin: 11px 0; }
+.workflow-table { border-collapse: collapse; width: 100%; font-size: 10px; text-align: left; }
+.workflow-table th { color: var(--accent); font-weight: 500; font-family: 'DM Mono', monospace; position: sticky; top: 0; background: var(--panel); }
+.workflow-table th, .workflow-table td { padding: 9px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+.workflow-table td { color: #b8c8bf; max-width: 270px; }
+.secondary-button { background: #20352a; color: var(--accent); border: 1px solid #3f5c47; border-radius: 5px; padding: 8px 10px; font-size: 10px; }
+.secondary-button:hover { background: #2a4834; }
+.secondary-button:disabled { cursor: not-allowed; opacity: .4; }
+.finding-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.finding-status-row { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; margin-top: 19px; }
+.verification-badge { border: 1px solid #3f5c47; color: var(--accent); border-radius: 4px; padding: 5px 7px; font: 10px 'DM Mono', monospace; }
+.finding-card .finding-workflow-section { margin-top: 14px; }
+.finding-workflow-section > summary { color: var(--accent); cursor: pointer; font-size: 12px; }
+.finding-workflow-section p { font-size: 12px; line-height: 1.6; color: #bccbc3; }
+.source-evidence, .verification-output, .apply-commands { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 280px; overflow: auto; background: #0b1315; color: #c1dacb; border: 1px solid #293b31; border-radius: 6px; padding: 12px; font: 10px/1.65 'DM Mono', monospace; }
+.flow-step { border-left: 2px solid #3a5d45; padding-left: 11px; margin: 13px 0; }
+.flow-step strong { font: 10px 'DM Mono', monospace; color: var(--accent); }
+.flow-step p { margin: 5px 0; }
+.finding-workflow-section .patch-editor { min-height: 180px; font: 10px/1.6 'DM Mono', monospace; resize: vertical; margin-bottom: 12px; }
+.finding-workflow-section .pr-body { min-height: 280px; font: 11px/1.6 'DM Mono', monospace; resize: vertical; margin-top: 10px; }
+.workflow-notes { min-height: 65px; margin: 8px 0; resize: vertical; }
+.pricing-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin: 15px 0; }
+.candidate-assessment { border: 1px solid #66583e; background: #28261e; border-radius: 6px; padding: 12px; margin-top: 13px; font-size: 11px; line-height: 1.6; }
+.candidate-assessment strong { color: #e4c89c; }
+.candidate-assessment p { color: #c5c2b5; margin: 6px 0 0; }
+#budgetForm h3 { margin: 0 0 16px; font-size: 22px; }
+@media (max-width: 800px) {
+  .review-settings { grid-template-columns: 1fr 1fr; }
+  .review-settings .show-dismissed { grid-column: 1 / -1; }
+  .policy-grid { grid-template-columns: 1fr; gap: 0; }
+}

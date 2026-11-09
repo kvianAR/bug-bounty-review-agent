@@ -14,6 +14,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
+import urllib.request
+import urllib.error
 
 
 SCHEMA = {
@@ -94,7 +96,43 @@ def github_accounts():
             and re.fullmatch(r"[A-Za-z0-9-]{1,39}", account["login"])]
 
 
-def resolve_repo(source, temporary_root, github_account=""):
+class NoGitHubRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, newurl):
+        return None
+
+
+def pull_request_metadata(owner, repository, number, credential=""):
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "TraceRepoReview"}
+    if credential:
+        headers["Authorization"] = "Bearer " + credential
+    endpoint = "https://api.github.com/repos/{}/{}/pulls/{}".format(owner, repository.removesuffix(".git"), number)
+    request = urllib.request.Request(endpoint, headers=headers)
+    try:
+        with urllib.request.build_opener(NoGitHubRedirect).open(request, timeout=15) as response:
+            data = json.loads(response.read(1_000_000))
+    except urllib.error.HTTPError as exc:
+        raise RepositoryAccessError("GitHub could not open this pull request. Check its URL and selected account.") from exc
+    base, head = data.get("base", {}).get("sha", ""), data.get("head", {}).get("sha", "")
+    if not all(re.fullmatch(r"[a-f0-9]{40,64}", value) for value in (base, head)):
+        raise ValueError("GitHub returned incomplete pull-request commit metadata")
+    comparison_url = "https://api.github.com/repos/{}/{}/compare/{}...{}?per_page=1".format(owner, repository.removesuffix(".git"), base, head)
+    try:
+        comparison_request = urllib.request.Request(comparison_url, headers=headers)
+        with urllib.request.build_opener(NoGitHubRedirect).open(comparison_request, timeout=15) as response:
+            body = response.read(5_000_001)
+            if len(body) > 5_000_000:
+                raise ValueError("Pull-request comparison exceeds the metadata size limit")
+            comparison = json.loads(body)
+    except urllib.error.HTTPError as exc:
+        raise RepositoryAccessError("Could not determine this pull request's merge base") from exc
+    merge_base = comparison.get("merge_base_commit", {}).get("sha", "")
+    if not re.fullmatch(r"[a-f0-9]{40,64}", merge_base):
+        raise ValueError("GitHub did not return a usable pull-request merge base")
+    return {"number": number, "base_commit": merge_base, "base_tip": base,
+            "head_commit": head, "url": data.get("html_url", endpoint)}
+
+
+def resolve_repo(source, temporary_root, github_account="", pull_request=None):
     local = Path(source).expanduser()
     if local.exists():
         if not local.is_dir():
@@ -134,6 +172,20 @@ def resolve_repo(source, temporary_root, github_account=""):
         if credential:
             detail = detail.replace(credential, "[redacted GitHub credential]").replace(encoded, "[redacted GitHub authorization]")
         raise RuntimeError("Clone failed: " + detail[-500:])
+    if pull_request is not None:
+        if type(pull_request) is not int or not 1 <= pull_request <= 10_000_000:
+            raise ValueError("Invalid pull-request number")
+        metadata = pull_request_metadata(parts[0], parts[1], pull_request, credential)
+        fetched = bounded_process(["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false",
+                                   "-c", "http.followRedirects=false", "-C", str(repo), "fetch", "--no-tags", "--depth", "1",
+                                   "origin", "refs/pull/{}/head".format(pull_request), metadata["base_commit"]], environment, 180)
+        if fetched.returncode:
+            raise RuntimeError("Could not fetch this pull request's head and base commits")
+        checkout = bounded_process(["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false",
+                                    "-C", str(repo), "checkout", "--detach", metadata["head_commit"]], environment, 15)
+        if checkout.returncode:
+            raise RuntimeError("Could not check out the pull-request head commit")
+        Path(temporary_root, "pull_request.json").write_text(json.dumps(metadata))
     return repo, url
 
 
@@ -269,12 +321,13 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("report"), help="Report directory")
     parser.add_argument("--focus", default="all security-relevant code")
     parser.add_argument("--github-account", default="", help="GitHub CLI account for private repositories")
+    parser.add_argument("--pull-request", type=int, help="Check out this pull-request head")
     args = parser.parse_args()
     if not shutil.which("codex"):
         parser.error("Codex CLI not found in PATH")
     with tempfile.TemporaryDirectory(prefix="bugbounty-agent-") as scratch:
         try:
-            repo, source = resolve_repo(args.repo, scratch, args.github_account)
+            repo, source = resolve_repo(args.repo, scratch, args.github_account, args.pull_request)
             schema = Path(scratch) / "schema.json"
             response = Path(scratch) / "response.json"
             schema.write_text(json.dumps(SCHEMA))

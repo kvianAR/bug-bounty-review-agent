@@ -44,6 +44,11 @@
           <label for="scanModel" class="model-label">Scan model</label>
           <div class="model-row"><select id="scanModel" aria-label="Scan model"><option value="">Codex default</option></select><button type="button" class="add-model-inline" id="addModelInline">+ Add model</button></div>
           <div id="scanKeyRow" class="key-row hidden"><label for="scanKey">Provider API key</label><select id="scanKey"><option value="">Select key</option></select><small>Repository content goes to your chosen provider. Your selected key pays for usage.</small></div>
+          <details class="advanced-scan"><summary>Scope, budget & fallback models</summary>
+            <label for="baseScan">Compare with a previous scan</label><select id="baseScan"><option value="">Full repository review</option></select>
+            <p class="field-help">A GitHub PR URL compares its base and head automatically. A baseline scan reviews changed files only.</p>
+            <div id="scanPolicyFields"></div>
+          </details>
           <div class="card-footer"><span><i class="shield-icon">◇</i> Source review · No live target requests</span><button type="submit" id="submitScan">Start scan <span>→</span></button></div>
         </form>
         <div class="steps"><div><span>01 /</span><strong>Connect</strong><p>Paste the repository URL.</p></div><div><span>02 /</span><strong>Investigate</strong><p>Agent traces security-relevant code.</p></div><div><span>03 /</span><strong>Resolve</strong><p>Review evidence, ask questions, plan the PR.</p></div></div>
@@ -51,6 +56,11 @@
 
       <section id="workspace" class="workspace view hidden">
         <div class="workspace-header"><div><span class="hero-eyebrow"><span class="eyebrow-line"></span> ACTIVE REVIEW</span><h2 id="repoName">Repository</h2><a id="repoLink" href="#" target="_blank" rel="noopener noreferrer">View repository ↗</a></div><div class="workspace-actions"><div id="statusPill" class="status-pill">Queued</div><button type="button" id="deleteScan" class="delete-scan">Delete scan</button></div></div>
+        <div id="workflowOverview" class="workflow-overview"></div>
+        <div id="operationStatus" class="operation-status hidden" role="status"></div>
+        <div class="review-settings"><div><label for="repairModel">Fix-draft model</label><select id="repairModel"><option value="__scan__">Use scan model</option></select></div><div><label for="repairKey">Fix-draft API key</label><select id="repairKey"><option value="__scan__">Use scan key</option></select></div><label class="show-dismissed"><input id="showDismissed" type="checkbox"> Show dismissed findings</label></div>
+        <details id="coveragePanel" class="insight-panel"><summary>Coverage & changes</summary><div id="coverageContent"></div></details>
+        <details id="usagePanel" class="insight-panel"><summary>Budget, usage & model attempts</summary><div id="usageContent"></div><button type="button" id="editBudget" class="secondary-button">Edit budget & fallback routes</button></details>
         <div class="workspace-grid">
           <div class="review-column">
             <div class="panel-heading"><span>REVIEW OUTPUT</span><span id="findingCount">—</span></div>
@@ -66,8 +76,10 @@
       </section>
       <dialog id="modelDialog" class="model-dialog"><div class="dialog-head"><div><span class="hero-eyebrow">MODEL LIBRARY</span><h3>Models & keys</h3></div><button type="button" id="closeModels" aria-label="Close">×</button></div><form id="modelForm"><p>Add Codex, OpenRouter, or a direct OpenAI-compatible model. Select each model for scans or chat.</p><label for="modelProvider">Route</label><select id="modelProvider"><option value="codex">Codex</option><option value="openrouter">OpenRouter</option><option value="custom">Direct provider</option></select><div id="customModelRow" class="hidden"><label for="customProvider">Direct provider</label><select id="customProvider"><option value="">Select provider</option></select></div><div id="catalogRow" class="hidden"><label for="catalogSearch">Find OpenRouter models</label><input id="catalogSearch" placeholder="Search MiMo, DeepSeek…" autocomplete="off"><div id="catalogResults" class="catalog-results"></div></div><label for="modelId">Model ID</label><input id="modelId" required maxlength="100" placeholder="e.g. gpt-6.1-sol" autocomplete="off"><label id="floorLabel" class="floor-option hidden"><input id="floorMode" type="checkbox"> Use :floor (cheapest provider)</label><div id="savedModels" class="saved-models"></div><div class="test-controls"><label for="testKey">Key for model test</label><select id="testKey"><option value="">Select key</option></select><div id="modelTestResult" role="status" aria-live="polite"></div></div><div class="dialog-actions"><button type="submit">Save model</button></div></form><form id="providerForm" class="key-form"><h4>Direct provider</h4><p>Enter an HTTPS OpenAI-compatible Chat Completions endpoint.</p><div class="preset-row"><button type="button" id="deepseekPreset">DeepSeek</button><button type="button" id="mimoPreset">MiMo</button></div><label for="providerName">Provider name</label><input id="providerName" maxlength="40" required placeholder="e.g. DeepSeek" autocomplete="off"><label for="providerEndpoint">Chat Completions URL</label><input id="providerEndpoint" type="url" required placeholder="https://api.example.com/v1/chat/completions" autocomplete="url"><div id="savedProviders" class="saved-models"></div><div class="dialog-actions"><button type="submit">Save provider</button></div></form><form id="keyForm" class="key-form"><h4>API keys</h4><p>On macOS, keys are saved in Keychain. Other systems keep them only until restart. Selected provider receives repository content and bills your key.</p><label for="keyAlias">Key name</label><input id="keyAlias" maxlength="40" required placeholder="Personal key" autocomplete="off"><label for="apiKey">API key</label><input id="apiKey" type="password" required placeholder="Paste provider key" autocomplete="off"><div id="savedKeys" class="saved-models"></div><div class="dialog-actions"><button type="button" id="cancelModels">Close</button><button type="submit">Add key</button></div></form></dialog>
       <div id="toast" class="toast hidden" role="alert"></div>
+      <dialog id="budgetDialog" class="model-dialog"><form id="budgetForm"><div class="dialog-head"><h3>Budget & fallback routes</h3><button type="button" id="closeBudget" aria-label="Close budget">×</button></div><div id="jobPolicyFields"></div><div class="dialog-actions"><button type="submit">Save budget</button></div></form></dialog>
     </main>
   </div>
+  <script src="/workflow-ui.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

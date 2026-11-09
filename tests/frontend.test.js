@@ -24,6 +24,7 @@ class Element {
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
   add(option) { this.children.push(option); }
+  insertBefore(child) { this.children.push(child); }
   setAttribute(name, value) { this.attributes[name] = value; }
   querySelector(selector) { return this.parts[selector] ||= new Element(); }
   focus() {}
@@ -61,6 +62,7 @@ async function harness() {
     return response(defaults[url] || job('A'));
   };
   const storage = new Map();
+  const clipboard = [];
   const context = vm.createContext({
     document: { getElementById: get, createElement: (tag) => new Element(tag),
       querySelectorAll: () => [], addEventListener() {}, activeElement: new Element('input') },
@@ -72,11 +74,12 @@ async function harness() {
     setTimeout: (callback, delay) => { timers.set(++timerId, { callback, delay }); return timerId; },
     clearTimeout: (id) => timers.delete(id),
     URL, URLSearchParams, console, confirm: () => true,
+    navigator: { clipboard: { writeText: async (text) => clipboard.push(text) } },
   });
-  const source = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  const source = fs.readFileSync(path.join(__dirname, '../public/workflow-ui.js'), 'utf8') + '\n' + fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
   vm.runInContext(source, context);
   await flush();
-  return { get, timers, context, run: (code) => vm.runInContext(code, context),
+  return { get, timers, context, clipboard, run: (code) => vm.runInContext(code, context),
     setFetch: (handler) => { fetchHandler = handler; } };
 }
 
@@ -191,4 +194,44 @@ test('confirmed scan deletion clears the selected view and history', async () =>
   await app.get('deleteScan').listeners.click();
   assert.equal(deletion, '/api/scans/aaaaaaaaaaaa');
   assert.equal(app.run('currentId'), null);
+});
+
+test('scan policy sends zero-cost limit and explicit fallback route', async () => {
+  const app = await harness();
+  app.get('repoUrl').value = 'https://github.com/owner/A';
+  app.get('scanCost').value = '0';
+  app.get('scanFallbackModel1').value = 'openrouter|fixture/fallback:free';
+  app.get('scanFallbackKey1').value = 'fallback-key';
+  let sent;
+  app.setFetch(async (url, options) => {
+    if (options.method === 'POST') { sent = JSON.parse(options.body); return response(job('A')); }
+    return response(url === '/api/scans' ? { scans: [] } : job('A'));
+  });
+  await app.get('scanForm').listeners.submit({ preventDefault() {} });
+  assert.equal(sent.policy.max_cost_usd, 0);
+  assert.deepEqual(sent.policy.fallbacks, [{ model: 'openrouter|fixture/fallback:free', key_alias: 'fallback-key' }]);
+});
+
+test('finding workflow exposes evidence, repair and complete PR copy controls', async () => {
+  const app = await harness();
+  const current = job('A', 'complete');
+  current.model = 'openrouter|fixture/model:free';
+  current.key_alias = 'fixture-key';
+  const candidate = { id: 'fixture', title: 'Fixture bug', severity: 'medium', confidence: 'high', cwe: 'CWE-22',
+    path: 'storage.py', line: 4, evidence: 'source', impact: 'impact', reproduction: 'repro', fix: 'fix', pr_checklist: [],
+    evidence_view: { snippet: '4: vulnerable source', flow: [{ label: 'Trigger', text: 'fixture trigger' }] },
+    verification: { status: 'not_run' }, pr: { title: 'Fix fixture', body: '## Complete PR body\n\nVerification pending.', apply_commands: 'git apply fix.patch', ready: false } };
+  current.report.findings = [candidate];
+  app.context.workflowFixture = current;
+  app.run('renderScan(workflowFixture)');
+  const buttons = [];
+  function visit(element) {
+    if (element.tagName === 'BUTTON') buttons.push(element);
+    for (const child of element.children || []) visit(child);
+  }
+  visit(app.get('findings'));
+  assert.ok(buttons.some((button) => button.textContent === 'Draft fix & PR'));
+  const copy = buttons.find((button) => button.textContent === 'Copy full PR body');
+  await copy.listeners.click();
+  assert.equal(app.clipboard[0], candidate.pr.body);
 });

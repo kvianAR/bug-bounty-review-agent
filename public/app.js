@@ -99,6 +99,7 @@ function renderModels() {
     list.append(badge);
   }
   updateKeyRows();
+  renderWorkflowChoices();
 }
 
 async function loadModels() {
@@ -134,6 +135,7 @@ function renderKeys() {
     badge.append(remove);
     list.append(badge);
   }
+  renderWorkflowChoices();
 }
 
 async function loadKeys() {
@@ -209,6 +211,7 @@ function showWelcome() {
 
 async function loadHistory() {
   const data = await api('/api/scans');
+  updateWorkflowHistory(data.scans);
   const container = $('history');
   container.replaceChildren();
   $('scanCount').textContent = data.scans.length;
@@ -245,6 +248,7 @@ function renderFinding(finding) {
   for (const step of finding.pr_checklist || []) list.append(node('li', '', step));
   more.append(list);
   card.append(more);
+  appendFindingTools(card, finding, activeScan);
   return card;
 }
 
@@ -272,6 +276,7 @@ function renderMessages(messages) {
 
 function renderScan(scan) {
   activeScan = scan;
+  renderWorkflowOverview(scan);
   $('welcome').classList.add('hidden');
   $('workspace').classList.remove('hidden');
   $('crumb').textContent = repoName(scan.url);
@@ -282,7 +287,7 @@ function renderScan(scan) {
   $('statusPill').className = `status-pill ${scan.status}`;
   const done = scan.status === 'complete';
   const failed = ['failed', 'interrupted'].includes(scan.status);
-  $('deleteScan').disabled = !['complete', 'failed', 'interrupted'].includes(scan.status) || pendingChats.has(scan.id);
+  $('deleteScan').disabled = !['complete', 'failed', 'interrupted'].includes(scan.status) || pendingChats.has(scan.id) || scan.operation?.status === 'running';
   $('retryScan').classList.toggle('hidden', !failed);
   $('chatInput').disabled = !done || pendingChats.has(scan.id);
   $('sendChat').disabled = !done || pendingChats.has(scan.id);
@@ -295,8 +300,10 @@ function renderScan(scan) {
   $('findingCount').textContent = done ? `${scan.report.findings.length} CANDIDATE${scan.report.findings.length === 1 ? '' : 'S'}` : '—';
   if (done) {
     $('summary').replaceChildren(node('strong', '', 'REVIEW SUMMARY'), node('span', '', scan.report.summary));
-    const findings = scan.report.findings;
-    if (!findings.length) $('findings').append(node('div', 'summary', 'No source-backed candidate findings in this scan. This does not prove the repository is secure.'));
+    const findings = scan.report.findings.filter((finding) => $('showDismissed').checked || !['dismissed', 'rejected'].includes(finding.triage?.decision));
+    const hidden = scan.report.findings.length - findings.length;
+    $('findingCount').textContent = `${scan.report.findings.length} CANDIDATE${scan.report.findings.length === 1 ? '' : 'S'}${hidden ? ` · ${hidden} dismissed hidden` : ''}`;
+    if (!findings.length) $('findings').append(node('div', 'summary', hidden ? 'Saved decisions hide these findings. Enable Show dismissed findings to review them.' : 'No source-backed candidate findings in this scan. This does not prove the repository is secure.'));
     for (const finding of findings) $('findings').append(renderFinding(finding));
     const limits = $('limitations');
     limits.replaceChildren(node('strong', '', 'LIMITS  '));
@@ -329,7 +336,7 @@ async function openScan(id, generation = null) {
     renderScan(scan);
     await loadHistory();
     if (currentId !== id || generation !== viewGeneration) return;
-    if (['queued', 'cloning', 'reviewing'].includes(scan.status)) pollTimer = setTimeout(() => openScan(id, generation), 3000);
+    if (['queued', 'cloning', 'reviewing'].includes(scan.status) || scan.operation?.status === 'running') pollTimer = setTimeout(() => openScan(id, generation), 3000);
   } catch (error) { toast(error.message); }
 }
 
@@ -340,7 +347,7 @@ $('scanForm').addEventListener('submit', async (event) => {
   button.textContent = 'Starting…';
   const generation = viewGeneration;
   try {
-    const scan = await api('/api/scans', { method: 'POST', body: JSON.stringify({ url: $('repoUrl').value.trim(), github_account: $('githubAccount').value, focus: $('focus').value.trim(), model: $('scanModel').value, key_alias: $('scanKey').value }) });
+    const scan = await api('/api/scans', { method: 'POST', body: JSON.stringify({ url: $('repoUrl').value.trim(), github_account: $('githubAccount').value, focus: $('focus').value.trim(), model: $('scanModel').value, key_alias: $('scanKey').value, base_scan: $('baseScan').value, policy: readWorkflowPolicy('scan') }) });
     if (generation === viewGeneration) await openScan(scan.id);
     else await loadHistory();
   } catch (error) { toast(error.message); }
@@ -377,7 +384,7 @@ $('chatForm').addEventListener('submit', async (event) => {
       $('chatInput').disabled = false;
       $('sendChat').disabled = false;
       if (generation === viewGeneration) $('chatInput').focus();
-      else openScan(id, viewGeneration);
+      openScan(id, viewGeneration);
     }
   }
 });
@@ -408,19 +415,22 @@ $('retryScan').addEventListener('click', () => {
   if (!activeScan) return;
   const scan = activeScan;
   showWelcome();
-  $('repoUrl').value = scan.url;
+  $('repoUrl').value = scan.target_url || scan.url;
   const owner = repoName(scan.url).split('/')[0];
   const account = scan.github_account || (scan.error_code === 'repository_access_required' && githubAccounts.some((item) => item.login === owner) ? owner : '');
   $('githubAccount').value = account;
   $('focus').value = scan.focus || '';
   $('scanModel').value = savedModels.includes(scan.model) ? scan.model : '';
   $('scanKey').value = savedKeys.includes(scan.key_alias) ? scan.key_alias : '';
+  writeWorkflowPolicy('scan', scan.policy || {});
+  updateBaselineChoices();
+  $('baseScan').value = scan.base_scan || '';
   updateKeyRows();
 });
 $('deleteScan').addEventListener('click', async () => {
   const id = currentId;
   const generation = viewGeneration;
-  if (!id || !confirm('Delete this scan, its report, chat history, and local repository checkout?')) return;
+  if (!id || !confirm('Delete this scan, its report, chat history, and local repository checkout? Saved repository triage decisions remain for future scans.')) return;
   $('deleteScan').disabled = true;
   try {
     await api(`/api/scans/${id}`, { method: 'DELETE', body: JSON.stringify({}) });
@@ -461,6 +471,9 @@ $('modelForm').addEventListener('submit', async (event) => {
   event.preventDefault();
   try {
     const provider = $('modelProvider').value;
+    const inputRate = $('inputPrice').value;
+    const outputRate = $('outputPrice').value;
+    if ((inputRate === '') !== (outputRate === '')) throw new Error('Enter both input and output prices, or leave both empty');
     let model = $('modelId').value.trim();
     if (provider === 'openrouter' && $('floorMode').checked && !/:(floor|free|nitro)$/.test(model)) model += ':floor';
     const providerName = $('customProvider').value;
@@ -468,6 +481,7 @@ $('modelForm').addEventListener('submit', async (event) => {
     savedModels = data.models;
     renderModels();
     const selected = provider === 'openrouter' ? `openrouter|${model}` : provider === 'custom' ? `custom|${providerName}|${model}` : model;
+    if (inputRate !== '' && outputRate !== '') await api('/api/model-prices', { method: 'POST', body: JSON.stringify({ model: selected, input: Number(inputRate), output: Number(outputRate), request: 0 }) });
     $('scanModel').value = selected;
     $('chatModel').value = selected;
     updateKeyRows();
@@ -510,6 +524,7 @@ $('keyForm').addEventListener('submit', async (event) => {
 document.addEventListener('keydown', (event) => {
   if (event.key.toLowerCase() === 'n' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) showWelcome();
 });
+initializeWorkflowUI();
 loadHistory().catch((error) => toast(error.message));
 loadModels().catch((error) => toast(error.message));
 loadKeys().catch((error) => toast(error.message));

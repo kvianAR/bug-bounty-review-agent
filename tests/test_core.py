@@ -54,7 +54,8 @@ def request(method, path, body=None, authenticated=True, **headers):
     server.Handler(connection, ("127.0.0.1", 12345), SimpleNamespace())
     head, content = bytes(connection.output).split(b"\r\n\r\n", 1)
     status = int(head.split(b" ")[1])
-    return status, json.loads(content) if content else None, head
+    value = json.loads(content) if content and b"application/json" in head else content or None
+    return status, value, head
 
 
 class CoreTests(unittest.TestCase):
@@ -66,7 +67,8 @@ class CoreTests(unittest.TestCase):
         self.data_patch.start()
         self.addCleanup(self.data_patch.stop)
         for collection in (server.JOBS, server.KEYS, server.MODELS, server.PROVIDERS,
-                           server.ACTIVE_KEYS, server.ACTIVE_CHATS):
+                           server.ACTIVE_KEYS, server.ACTIVE_CHATS, server.ACTIVE_WORKFLOWS,
+                           server.TRIAGE, server.MODEL_PRICES):
             collection.clear()
 
     def test_repository_url_and_clone_deadline(self):
@@ -151,9 +153,9 @@ class CoreTests(unittest.TestCase):
         repo = self.folder / "repo"
         repo.mkdir()
         (repo / "auth.py").write_text("x = 1 # " + "x" * 300 + "\n" * 10)
-        with mock.patch.object(server.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="auth.py\n")):
-            excerpt, count = server.source_context(repo, 200)
-        self.assertEqual(1, count)
+        with mock.patch.object(server.workflow, "tracked_files", return_value=["auth.py"]):
+            excerpt, coverage = server.workflow.coverage_context(repo, 200)
+        self.assertEqual(1, coverage["totals"]["partial"])
         self.assertLessEqual(len(excerpt), 200)
 
     def test_scan_export_keeps_source_url_and_bad_output_finishes(self):
@@ -164,11 +166,13 @@ class CoreTests(unittest.TestCase):
         job = {"id": "fixture", "url": url, "focus": "auth", "model": "openrouter|vendor/model:free",
                "key_alias": "key", "status": "queued", "messages": []}
         server.JOBS["fixture"] = job
+        server.KEYS["key"] = "dummy-provider-key"
         server.save(job)
+        coverage = {"totals": {"included": 1, "partial": 0, "skipped": 0}, "files": [], "characters": 14, "character_limit": 65000}
         with mock.patch.object(server, "resolve_repo", return_value=(repo, url)), \
-             mock.patch.object(server, "source_context", return_value=("SOURCE_EXCERPT", 1)), \
+             mock.patch.object(server.workflow, "coverage_context", return_value=("SOURCE_EXCERPT", coverage)), \
              mock.patch.object(server, "custom_completion", return_value=json.dumps(report())), \
-             mock.patch.object(server.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="commit")):
+             mock.patch.object(server.workflow, "git", return_value=SimpleNamespace(returncode=0, stdout="commit")):
             server.run_scan("fixture")
         self.assertEqual("complete", job["status"])
         text = (self.folder / "fixture/report.md").read_text()
