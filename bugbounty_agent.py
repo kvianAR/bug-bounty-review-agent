@@ -3,8 +3,10 @@
 
 import argparse
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -66,36 +68,125 @@ def resolve_repo(source, temporary_root):
             raise ValueError("Repository path must be a directory")
         return local.resolve(), "local"
     parsed = urlparse(source)
-    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "www.github.com"}:
+    if (parsed.scheme != "https" or parsed.hostname not in {"github.com", "www.github.com"}
+            or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or parsed.port not in (None, 443)):
         raise ValueError("Use a local repository path or an https://github.com/owner/repo URL")
     parts = [p for p in parsed.path.strip("/").split("/") if p]
     if len(parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) for p in parts):
         raise ValueError("GitHub URL must be https://github.com/owner/repo")
     repo = Path(temporary_root) / "repo"
     url = "https://github.com/{}/{}".format(parts[0], parts[1])
-    result = subprocess.run(["git", "clone", "--depth", "1", "--", url, str(repo)],
-                            capture_output=True, text=True)
+    result = bounded_process(["git", "-c", "credential.helper=", "-c", "core.hooksPath=" + os.devnull,
+                             "-c", "core.fsmonitor=false", "clone", "--depth", "1",
+                             "--no-recurse-submodules", "--", url, str(repo)],
+                            env=git_environment(temporary_root), timeout=180)
     if result.returncode:
         raise RuntimeError("Clone failed: " + result.stderr.strip()[-500:])
     return repo, url
 
 
+def git_environment(home):
+    environment = {key: value for key, value in os.environ.items() if key in {"PATH", "SYSTEMROOT"}}
+    environment.update(HOME=str(home), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_TERMINAL_PROMPT="0", LANG="en_US.UTF-8")
+    return environment
+
+
+def bounded_process(command, env, timeout):
+    process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=os.name == "posix")
+    try:
+        output, errors = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, output, errors)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Process exceeded its {} second deadline".format(timeout)) from None
+    finally:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+
+
+def run_codex(prompt, response, model="", schema=None, timeout=1800):
+    executable = shutil.which("codex")
+    if not executable:
+        raise RuntimeError("Codex CLI not found in PATH")
+    allowed = {"PATH", "HOME", "CODEX_HOME", "OPENAI_API_KEY", "CODEX_API_KEY", "SYSTEMROOT"}
+    environment = {key: value for key, value in os.environ.items() if key in allowed}
+    environment["LANG"] = "en_US.UTF-8"
+    with tempfile.TemporaryDirectory(prefix="trace-codex-") as directory:
+        # Start outside the target so repository .codex config and hooks cannot auto-load.
+        Path(directory, ".git").mkdir()
+        command = [executable, "exec", "--ignore-user-config", "--ephemeral", "--sandbox", "read-only",
+                   "--skip-git-repo-check", "-C", directory,
+                   "-c", "project_doc_max_bytes=0", "-c", "mcp_servers={}",
+                   "-c", 'shell_environment_policy.inherit="none"',
+                   "--output-last-message", str(response.resolve())]
+        if schema is not None:
+            command.extend(["--output-schema", str(schema.resolve())])
+        if model:
+            command.extend(["-m", model])
+        return bounded_process(command + [prompt], env=environment, timeout=timeout)
+
+
 def validate_findings(data, repo):
+    data = normalize_report(data)
     checked = []
     for finding in data.get("findings", []):
-        relative = Path(finding["path"])
-        path = (repo / relative).resolve()
-        if relative.is_absolute() or not path.is_relative_to(repo.resolve()) or not path.is_file():
-            continue
         try:
+            relative = Path(finding["path"])
+            path = (repo / relative).resolve()
+            if relative.is_absolute() or not path.is_relative_to(repo.resolve()) or not path.is_file():
+                continue
+            if path.stat().st_size > 2_000_000:
+                continue
             lines = path.read_text(errors="replace").splitlines()
-        except OSError:
+        except (OSError, ValueError, RuntimeError):
             continue
         if finding["line"] > len(lines):
             continue
         checked.append(finding)
+    if len(checked) != len(data["findings"]):
+        data["limitations"].append("Findings with invalid source paths, lines, or files larger than 2 MB were discarded.")
     data["findings"] = checked
     return data
+
+
+def normalize_report(report):
+    if not isinstance(report, dict) or not isinstance(report.get("summary"), str) or not isinstance(report.get("findings"), list):
+        raise ValueError("Model returned an incomplete report")
+    normalized = {"summary": report["summary"], "findings": [], "limitations": []}
+    limits = report.get("limitations", [])
+    if isinstance(limits, list):
+        normalized["limitations"] = [item for item in limits if isinstance(item, str)]
+    text_fields = {"title", "cwe", "path", "evidence", "impact", "reproduction", "fix"}
+    for finding in report["findings"]:
+        if not isinstance(finding, dict):
+            continue
+        if not all(isinstance(finding.get(field), str) for field in text_fields):
+            continue
+        severity = finding.get("severity")
+        confidence = finding.get("confidence")
+        line = finding.get("line")
+        checklist = finding.get("pr_checklist")
+        if (not isinstance(severity, str) or severity not in {"critical", "high", "medium", "low"}
+                or not isinstance(confidence, str) or confidence not in {"high", "medium", "low"}
+                or type(line) is not int or line < 1 or not isinstance(checklist, list)
+                or not all(isinstance(step, str) for step in checklist)):
+            continue
+        normalized["findings"].append({field: finding[field] for field in SCHEMA["properties"]["findings"]["items"]["required"]})
+    if len(normalized["findings"]) != len(report["findings"]):
+        normalized["limitations"].append("Malformed model findings were discarded.")
+    return normalized
 
 
 def render_markdown(data, source, commit):
@@ -135,23 +226,18 @@ def main():
             schema = Path(scratch) / "schema.json"
             response = Path(scratch) / "response.json"
             schema.write_text(json.dumps(SCHEMA))
-            result = subprocess.run(
-                ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
-                 "--output-schema", str(schema), "--output-last-message", str(response),
-                 "-C", str(repo), PROMPT.format(repo=repo, focus=args.focus)],
-                capture_output=True, text=True,
-            )
+            result = run_codex(PROMPT.format(repo=repo, focus=args.focus), response, schema=schema)
             if result.returncode:
                 raise RuntimeError("Review failed: " + result.stderr.strip()[-1000:])
             data = validate_findings(json.loads(response.read_text()), repo)
             commit_result = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                                           capture_output=True, text=True)
+                                           env=git_environment(scratch), capture_output=True, text=True, timeout=10)
             commit = commit_result.stdout.strip() if commit_result.returncode == 0 else None
             args.output.mkdir(parents=True, exist_ok=True)
             (args.output / "findings.json").write_text(json.dumps(data, indent=2) + "\n")
             (args.output / "report.md").write_text(render_markdown(data, source, commit))
             print("{} candidate finding(s). Reports: {}".format(len(data["findings"]), args.output.resolve()))
-        except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+        except (ValueError, RuntimeError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
             parser.exit(1, "Error: {}\n".format(exc))
 
 

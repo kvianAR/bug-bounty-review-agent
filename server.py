@@ -2,12 +2,15 @@
 """Local web UI and API for repository security reviews."""
 
 import json
+import copy
+import http.client
 import ipaddress
 import os
 import re
 import secrets
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -17,12 +20,12 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from http.cookies import SimpleCookie
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
-from bugbounty_agent import PROMPT, SCHEMA, render_markdown, validate_findings, resolve_repo
+from bugbounty_agent import PROMPT, SCHEMA, render_markdown, validate_findings, resolve_repo, normalize_report, run_codex, git_environment
 
 
 ROOT = Path(__file__).resolve().parent
@@ -38,6 +41,29 @@ PROVIDERS = []
 KEYS = {}
 CATALOG = {"at": 0, "models": []}
 LOCK = threading.Lock()
+ACTIVE_CHATS = set()
+ACTIVE_KEYS = {}
+WORK_SLOTS = threading.BoundedSemaphore(2)
+
+
+class WorkBusy(RuntimeError):
+    pass
+
+
+@contextmanager
+def model_work(key_alias):
+    if not WORK_SLOTS.acquire(blocking=False):
+        raise WorkBusy("Two model requests are already running. Try again when one finishes.")
+    with LOCK:
+        ACTIVE_KEYS[key_alias] = ACTIVE_KEYS.get(key_alias, 0) + 1
+    try:
+        yield
+    finally:
+        with LOCK:
+            ACTIVE_KEYS[key_alias] -= 1
+            if not ACTIVE_KEYS[key_alias]:
+                del ACTIVE_KEYS[key_alias]
+        WORK_SLOTS.release()
 
 
 def now():
@@ -46,18 +72,29 @@ def now():
 
 def save(job):
     folder = DATA / job["id"]
-    folder.mkdir(parents=True, exist_ok=True)
-    temp = folder / "job.tmp"
-    temp.write_text(json.dumps(job, indent=2) + "\n")
-    temp.replace(folder / "job.json")
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    private_write(folder / "job.json", json.dumps(job, indent=2) + "\n")
+
+
+def private_write(path, content):
+    descriptor, name = tempfile.mkstemp(prefix=".trace-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
 def visible(job):
-    return {key: value for key, value in job.items() if key != "repo_path"}
+    return copy.deepcopy({key: value for key, value in job.items() if key != "repo_path"})
 
 
 def load_jobs():
-    DATA.mkdir(parents=True, exist_ok=True)
+    DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
+    DATA.chmod(0o700)
     model_file = DATA / "models.json"
     if model_file.exists():
         try:
@@ -93,63 +130,98 @@ def load_jobs():
             continue
 
 
-def save_models():
-    temp = DATA / "models.tmp"
-    temp.write_text(json.dumps(MODELS, indent=2) + "\n")
-    temp.replace(DATA / "models.json")
+def save_models(models=None):
+    private_write(DATA / "models.json", json.dumps(MODELS if models is None else models, indent=2) + "\n")
 
 
-def save_providers():
-    temp = DATA / "providers.tmp"
-    temp.write_text(json.dumps(PROVIDERS, indent=2) + "\n")
-    temp.replace(DATA / "providers.json")
+def save_providers(providers=None):
+    private_write(DATA / "providers.json", json.dumps(PROVIDERS if providers is None else providers, indent=2) + "\n")
 
 
 def keychain_enabled():
     return sys.platform == "darwin" and shutil.which("security") is not None
 
 
-def save_key_aliases():
+def save_key_aliases(aliases=None):
     path = DATA / "key_aliases.json"
-    path.write_text(json.dumps(sorted(KEYS), indent=2) + "\n")
-    path.chmod(0o600)
+    private_write(path, json.dumps(sorted(KEYS if aliases is None else aliases), indent=2) + "\n")
 
 
 def store_key(alias, key):
-    if keychain_enabled():
-        result = subprocess.run(["security", "add-generic-password", "-a", alias,
-                                 "-s", "ai.trace.repository-review", "-U", "-w"],
-                                input=key + "\n" + key + "\n", capture_output=True,
-                                text=True, timeout=15)
-        if result.returncode:
-            raise RuntimeError("Could not save key in macOS Keychain")
     with LOCK:
-        KEYS[alias] = key
+        if ACTIVE_KEYS.get(alias) or any(job.get("key_alias") == alias and job["status"] in {"queued", "cloning", "reviewing"} for job in JOBS.values()):
+            raise ValueError("Key is being used by active work")
         if keychain_enabled():
-            save_key_aliases()
+            aliases = set(KEYS) | {alias}
+            save_key_aliases(aliases)
+            try:
+                write_keychain(alias, key)
+                refresh_keychain(alias)
+                if KEYS.get(alias) != key:
+                    raise RuntimeError("Keychain did not retain the requested key")
+            except (OSError, RuntimeError, subprocess.TimeoutExpired):
+                reconcile_keychain(alias)
+                raise
+        KEYS[alias] = key
         return sorted(KEYS)
+
+
+def write_keychain(alias, key):
+    result = subprocess.run(["security", "add-generic-password", "-a", alias,
+                             "-s", "ai.trace.repository-review", "-U", "-w"],
+                            input=key + "\n" + key + "\n", capture_output=True,
+                            text=True, timeout=15)
+    if result.returncode:
+        raise RuntimeError("Could not save key in macOS Keychain")
+
+
+def refresh_keychain(alias):
+    result = subprocess.run(["security", "find-generic-password", "-a", alias,
+                             "-s", "ai.trace.repository-review", "-w"],
+                            capture_output=True, text=True, timeout=15)
+    if result.returncode == 0:
+        KEYS[alias] = result.stdout.strip()
+    elif result.returncode == 44:
+        KEYS.pop(alias, None)
+    else:
+        raise RuntimeError("Could not verify Keychain state")
+
+
+def reconcile_keychain(alias):
+    try:
+        refresh_keychain(alias)
+        save_key_aliases()
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        KEYS.pop(alias, None)
+        raise RuntimeError("Keychain state could not be verified. Re-add this key before using it.") from exc
 
 
 def delete_key(alias):
     if keychain_enabled():
-        result = subprocess.run(["security", "delete-generic-password", "-a", alias,
-                                 "-s", "ai.trace.repository-review"],
-                                capture_output=True, text=True, timeout=15)
-        if result.returncode:
-            raise RuntimeError("Could not delete key from macOS Keychain")
-    del KEYS[alias]
-    if keychain_enabled():
-        save_key_aliases()
+        save_key_aliases(set(KEYS) - {alias})
+        try:
+            result = subprocess.run(["security", "delete-generic-password", "-a", alias,
+                                     "-s", "ai.trace.repository-review"],
+                                    capture_output=True, text=True, timeout=15)
+            if result.returncode:
+                raise RuntimeError("Could not delete key from macOS Keychain")
+            refresh_keychain(alias)
+            if alias in KEYS:
+                raise RuntimeError("Keychain retained the key after deletion")
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            reconcile_keychain(alias)
+            raise
+    KEYS.pop(alias, None)
 
 
 def run_scan(job_id):
-    with LOCK:
-        job = JOBS[job_id]
-        job["status"] = "cloning"
-        save(job)
+    job = JOBS[job_id]
     folder = DATA / job_id
     try:
-        repo, source = resolve_repo(job["url"], folder)
+        with LOCK:
+            job["status"] = "cloning"
+            save(job)
+        repo, source_url = resolve_repo(job["url"], folder)
         schema = folder / "schema.json"
         response = folder / "response.json"
         schema.write_text(json.dumps(SCHEMA))
@@ -159,46 +231,47 @@ def run_scan(job_id):
             save(job)
         focus = job["focus"][:250]
         if job["model"].startswith(("custom|", "openrouter|")):
-            source, count = source_context(repo, 65000)
+            excerpt, count = source_context(repo, 65000)
+            if not count:
+                raise RuntimeError("No supported source files could be included in this review")
             prompt = ("Review the supplied repository source for reachable security bugs. "
                       "Return only a JSON object matching this schema: " + json.dumps(SCHEMA) +
                       "\nDo not invent paths or line numbers. Do not include secret values. "
                       "If evidence is weak, return no findings. Focus: " + focus +
-                      "\nRepository source (line numbers included):\n" + source)
+                      "\nRepository source (line numbers included):\n" + excerpt)
             answer = custom_completion(job["model"], job.get("key_alias", ""),
                                        [{"role": "user", "content": prompt}], 180)
             report = parse_report(answer)
             report["limitations"].append("Custom-provider review included {} selected source files, capped at 65,000 characters.".format(count))
         else:
             prompt = PROMPT.format(repo=repo, focus=focus)
-            command = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
-                       "--output-schema", str(schema), "--output-last-message", str(response),
-                       "-C", str(repo)]
-            model_args, model_env = model_options(job["model"], job.get("key_alias", ""))
-            result = subprocess.run(command + model_args + [prompt], env=model_env,
-                                    capture_output=True, text=True, timeout=3600)
+            result = run_codex(prompt, response, model=job["model"], schema=schema, timeout=3600)
             if result.returncode:
                 raise RuntimeError("Codex review failed: " + safe_error(result.stderr.strip()))
             report = json.loads(response.read_text())
         report = validate_findings(report, repo)
-        commit_result = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                                       capture_output=True, text=True)
+        commit_result = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", str(repo), "rev-parse", "HEAD"],
+                                       env=git_environment(folder), capture_output=True, text=True, timeout=10)
         commit = commit_result.stdout.strip() if commit_result.returncode == 0 else None
-        (folder / "report.md").write_text(render_markdown(report, source, commit))
-        (folder / "findings.json").write_text(json.dumps(report, indent=2) + "\n")
+        private_write(folder / "report.md", render_markdown(report, source_url, commit))
+        private_write(folder / "findings.json", json.dumps(report, indent=2) + "\n")
         with LOCK:
             job["status"] = "complete"
             job["report"] = report
             job["commit"] = commit
             job["updated_at"] = now()
             save(job)
-    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+    except Exception as exc:
+        # A background worker must always publish a terminal state, even for malformed provider data.
         error = safe_error(str(exc))
         with LOCK:
             job["status"] = "failed"
             job["error"] = error
             job["updated_at"] = now()
-            save(job)
+            try:
+                save(job)
+            except OSError:
+                job["error"] += " Scan state could not be saved."
 
 
 def run_chat(job, question, model):
@@ -220,11 +293,8 @@ insufficient. Do not claim a vulnerability is confirmed without local reproducti
 
 Report JSON:\n{report}\n\nRecent chat:\n{history}\n\nUser question:\n{question}
 """.format(report=json.dumps(job["report"])[:30000], history=context, question=question)
-    command = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
-               "--output-last-message", str(response), "-C", job["repo_path"]]
-    model_args, model_env = model_options(model, job.get("active_key_alias", ""))
-    result = subprocess.run(command + model_args + [prompt], env=model_env,
-                            capture_output=True, text=True, timeout=600)
+    prompt = "Repository path: {}\n".format(job["repo_path"]) + prompt
+    result = run_codex(prompt, response, model=model, timeout=600)
     if result.returncode:
         raise RuntimeError("Chat failed: " + safe_error(result.stderr.strip()))
     answer = response.read_text().strip()
@@ -232,19 +302,13 @@ Report JSON:\n{report}\n\nRecent chat:\n{history}\n\nUser question:\n{question}
     return answer
 
 
-def model_options(model, key_alias):
-    env = os.environ.copy()
-    if model.startswith(("openrouter|", "custom|")):
-        raise ValueError("Direct API model cannot use Codex CLI route")
-    return (["-m", model] if model else []), env
-
-
 SOURCE_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java",
                    ".rb", ".php", ".sh", ".json", ".yaml", ".yml", ".toml"}
 
 
 def source_context(repo, limit):
-    result = subprocess.run(["git", "-C", str(repo), "ls-files"], capture_output=True, text=True)
+    result = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", str(repo), "ls-files"],
+                            env=git_environment(repo.parent), capture_output=True, text=True, timeout=10)
     paths = result.stdout.splitlines() if result.returncode == 0 else []
     if not paths:
         paths = [str(path.relative_to(repo)) for path in repo.rglob("*") if path.is_file()]
@@ -269,9 +333,10 @@ def source_context(repo, limit):
             line = re.sub(r"(?i)((?:api[_-]?key|secret|password|token)\s*[:=]\s*)[^,\s]+", r"\1[REDACTED]", line)
             excerpt.append("{}: {}".format(number, line[:300]))
         chunk = "\nFILE {}\n{}\n".format(name, "\n".join(excerpt))
-        if sum(map(len, chunks)) + len(chunk) > limit:
+        remaining = limit - len("\n".join(chunks)) - 1
+        if remaining < 100:
             break
-        chunks.append(chunk)
+        chunks.append(chunk[:remaining])
         used += 1
     return "\n".join(chunks), used
 
@@ -285,45 +350,63 @@ def parse_report(answer):
         raise RuntimeError("Model did not return a JSON report")
     try:
         report = json.loads(body[start:end + 1])
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         raise RuntimeError("Model returned invalid report JSON") from exc
-    if not isinstance(report, dict) or not isinstance(report.get("summary"), str) or not isinstance(report.get("findings"), list):
-        raise RuntimeError("Model returned an incomplete report")
-    report["limitations"] = report.get("limitations", [])
-    if not isinstance(report["limitations"], list):
-        report["limitations"] = []
-    required = SCHEMA["properties"]["findings"]["items"]["required"]
-    text_fields = {"title", "cwe", "path", "evidence", "impact", "reproduction", "fix"}
-    valid = [finding for finding in report["findings"] if isinstance(finding, dict)
-             and all(field in finding for field in required)
-             and all(isinstance(finding[field], str) for field in text_fields)
-             and finding["severity"] in {"critical", "high", "medium", "low"}
-             and finding["confidence"] in {"high", "medium", "low"}
-             and isinstance(finding["line"], int) and finding["line"] > 0
-             and isinstance(finding["pr_checklist"], list)
-             and all(isinstance(step, str) for step in finding["pr_checklist"])]
-    if len(valid) != len(report["findings"]):
-        report["limitations"].append("Some malformed model findings were discarded.")
-    report["findings"] = valid
-    return report
+    return normalize_report(report)
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, fp, code, msg, headers, newurl):
-        return None
+class PublicHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, port, addresses, timeout):
+        super().__init__(host, port=port, timeout=timeout, context=ssl.create_default_context())
+        self.addresses = addresses
+        self.deadline = time.monotonic() + timeout
+
+    def connect(self):
+        # Pin DNS results while keeping TLS certificate verification and SNI on the hostname.
+        failure = None
+        for address in self.addresses[:4]:
+            connection = None
+            try:
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Provider deadline exceeded")
+                connection = socket.create_connection((address, self.port), timeout=min(10, remaining))
+                self.sock = self._context.wrap_socket(connection, server_hostname=self.host)
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Provider deadline exceeded during TLS handshake")
+                self.sock.settimeout(remaining)
+                return
+            except OSError as exc:
+                failure = exc
+                if self.sock is not None:
+                    self.sock.close()
+                    self.sock = None
+                if connection is not None:
+                    connection.close()
+        raise OSError("Could not connect to the validated provider address") from failure
 
 
 def validate_endpoint(url):
+    if any(character.isspace() or ord(character) < 32 for character in url):
+        raise ValueError("Provider endpoint must not contain whitespace")
     parsed = urlparse(url)
     if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
             or parsed.query or parsed.fragment or not parsed.path.endswith("/chat/completions")):
         raise ValueError("Use a public HTTPS Chat Completions endpoint ending in /chat/completions")
     try:
-        addresses = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
+        port = parsed.port or 443
+        if not 1 <= port <= 65535:
+            raise ValueError("Invalid provider port")
+        host = parsed.hostname.encode("idna").decode("ascii")
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise ValueError("Provider hostname could not be resolved") from exc
     if not addresses or not all(ipaddress.ip_address(item[4][0]).is_global for item in addresses):
         raise ValueError("Provider endpoint must resolve to public IP addresses")
+    pinned = list(dict.fromkeys(item[4][0] for item in addresses))
+    pinned.sort(key=lambda address: ipaddress.ip_address(address).version)
+    return host, port, parsed.path, pinned
 
 
 def custom_completion(model, key_alias, messages, timeout):
@@ -339,21 +422,54 @@ def custom_completion(model, key_alias, messages, timeout):
         key = KEYS.get(key_alias)
     if not provider or not key:
         raise ValueError("Select a configured provider and API key")
-    validate_endpoint(provider["endpoint"])
+    host, port, path, addresses = validate_endpoint(provider["endpoint"])
     payload = json.dumps({"model": model_id, "messages": messages, "stream": False}).encode()
-    request = urllib.request.Request(provider["endpoint"], data=payload,
-        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
-                 "User-Agent": "TraceRepoReview/0.1"}, method="POST")
+    connection = PublicHTTPSConnection(host, port, addresses, timeout)
+    expired = threading.Event()
+    response_socket = [None]
+    def expire():
+        expired.set()
+        active_socket = response_socket[0] or connection.sock
+        if active_socket is not None:
+            try:
+                active_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        connection.close()
+    timer = threading.Timer(timeout, expire)
+    timer.daemon = True
+    timer.start()
     try:
-        with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as response:
-            data = json.loads(response.read(2_000_000))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read(1000).decode(errors="replace")
-        raise RuntimeError("Provider returned HTTP {}: {}".format(exc.code, safe_error(detail))) from exc
+        connection.request("POST", path, body=payload, headers={
+            "Authorization": "Bearer " + key, "Content-Type": "application/json",
+            "User-Agent": "TraceRepoReview/0.1"})
+        response_socket[0] = connection.sock
+        if expired.is_set():
+            raise RuntimeError("Provider request deadline exceeded")
+        response = connection.getresponse()
+        body = response.read(2_000_001)
+        if response.status != 200:
+            detail = safe_error(body.decode(errors="replace"), [key])
+            raise RuntimeError("Provider returned HTTP {}: {}".format(response.status, detail))
+        if len(body) > 2_000_000:
+            raise RuntimeError("Provider response exceeds 2 MB")
+        try:
+            data = json.loads(body)
+        except (ValueError, RecursionError) as exc:
+            raise RuntimeError("Provider returned malformed JSON") from exc
+        if expired.is_set():
+            raise RuntimeError("Provider request deadline exceeded")
+    except (OSError, http.client.HTTPException) as exc:
+        if expired.is_set():
+            raise RuntimeError("Provider request deadline exceeded") from exc
+        raise RuntimeError("Provider connection failed: " + safe_error(str(exc), [key])) from exc
+    finally:
+        timer.cancel()
+        connection.close()
     try:
         content = data["choices"][0]["message"]["content"]
         if isinstance(content, str) and content.strip():
-            return content.strip()
+            return content.strip().replace(key, "[redacted key]")
     except (KeyError, IndexError, TypeError):
         pass
     raise RuntimeError("Provider returned no text content")
@@ -378,32 +494,31 @@ def openrouter_catalog(query):
     return matches[:20]
 
 
-def safe_error(message):
+def safe_error(message, sensitive=()):
     with LOCK:
         keys = list(KEYS.values())
-    for key in keys:
-        message = message.replace(key, "[redacted key]")
+    for key in keys + list(sensitive):
+        if key:
+            message = message.replace(key, "[redacted key]")
     return message[-500:]
 
 
 def test_model(model, key_alias):
     if model.startswith(("custom|", "openrouter|")):
-        return custom_completion(model, key_alias,
-            [{"role": "user", "content": "Reply with the exact text TRACE_MODEL_OK."}], 60)[:300]
+        answer = custom_completion(model, key_alias,
+            [{"role": "user", "content": "Reply with the exact text TRACE_MODEL_OK."}], 60)
+        if answer.strip() != "TRACE_MODEL_OK":
+            raise RuntimeError("Model responded but did not pass the expected-response check")
+        return "TRACE_MODEL_OK"
     with tempfile.TemporaryDirectory(prefix="trace-model-test-") as folder:
         response = Path(folder) / "answer.txt"
-        command = ["codex", "exec", "--ephemeral", "--sandbox", "read-only",
-                   "--skip-git-repo-check", "--output-last-message", str(response),
-                   "-C", folder]
-        args, env = model_options(model, key_alias)
-        result = subprocess.run(command + args + ["Reply with the exact text TRACE_MODEL_OK."],
-                                env=env, capture_output=True, text=True, timeout=180)
+        result = run_codex("Reply with the exact text TRACE_MODEL_OK.", response, model=model, timeout=180)
         if result.returncode:
             raise RuntimeError(safe_error(result.stderr) or "Model test failed")
         answer = response.read_text().strip()
-        if not answer:
-            raise RuntimeError("Model returned no text")
-        return answer[:300]
+        if answer != "TRACE_MODEL_OK":
+            raise RuntimeError("Model responded but did not pass the expected-response check")
+        return answer
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -416,12 +531,9 @@ class Handler(BaseHTTPRequestHandler):
         return host in {"127.0.0.1", "localhost"}
 
     def authenticated(self):
-        cookie = SimpleCookie()
         try:
-            cookie.load(self.headers.get("Cookie", ""))
-            token = cookie.get("trace_session")
-            return bool(token and secrets.compare_digest(token.value, SESSION_TOKEN))
-        except Exception:
+            return secrets.compare_digest(self.headers.get("Authorization", ""), "Bearer " + SESSION_TOKEN)
+        except TypeError:
             return False
 
     def send_json(self, code, value):
@@ -451,8 +563,9 @@ class Handler(BaseHTTPRequestHandler):
             token = parsed.query[6:]
             if secrets.compare_digest(token, SESSION_TOKEN):
                 self.send_response(302)
-                self.send_header("Set-Cookie", "trace_session={}; HttpOnly; SameSite=Strict; Path=/".format(SESSION_TOKEN))
-                self.send_header("Location", "/")
+                self.send_header("Location", "/#token=" + quote(SESSION_TOKEN, safe=""))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
                 self.end_headers()
                 return
             return self.send_json(403, {"error": "Invalid access link"})
@@ -533,7 +646,8 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("Save the model before testing")
                     if model.startswith(("openrouter|", "custom|")) and key_alias not in KEYS:
                         raise ValueError("Select an API key")
-                answer = test_model(model, key_alias)
+                with model_work(key_alias):
+                    answer = test_model(model, key_alias)
                 return self.send_json(200, {"ok": True, "answer": answer})
             if path == "/api/models":
                 model = str(data.get("id", "")).strip()
@@ -554,8 +668,9 @@ class Handler(BaseHTTPRequestHandler):
                     model = "custom|" + provider_name + "|" + model
                 with LOCK:
                     if model not in MODELS:
-                        MODELS.append(model)
-                        save_models()
+                        updated = MODELS + [model]
+                        save_models(updated)
+                        MODELS[:] = updated
                 return self.send_json(201, {"models": list(MODELS)})
             if path == "/api/providers":
                 name = str(data.get("name", "")).strip()
@@ -566,8 +681,9 @@ class Handler(BaseHTTPRequestHandler):
                 with LOCK:
                     if any(item["name"] == name for item in PROVIDERS):
                         raise ValueError("Provider name already exists")
-                    PROVIDERS.append({"name": name, "endpoint": endpoint})
-                    save_providers()
+                    updated = PROVIDERS + [{"name": name, "endpoint": endpoint}]
+                    save_providers(updated)
+                    PROVIDERS[:] = updated
                     providers = list(PROVIDERS)
                 return self.send_json(201, {"providers": providers})
             if path == "/api/keys":
@@ -596,9 +712,18 @@ class Handler(BaseHTTPRequestHandler):
                        "status": "queued", "created_at": now(), "updated_at": now(),
                        "messages": []}
                 with LOCK:
-                    JOBS[job_id] = job
+                    if sum(job["status"] in {"queued", "cloning", "reviewing"} for job in JOBS.values()) >= 2:
+                        raise WorkBusy("Two scans are already running. Wait for one to finish.")
                     save(job)
-                threading.Thread(target=run_scan, args=(job_id,), daemon=True).start()
+                    JOBS[job_id] = job
+                try:
+                    threading.Thread(target=run_scan, args=(job_id,), daemon=True).start()
+                except RuntimeError:
+                    with LOCK:
+                        job["status"] = "failed"
+                        job["error"] = "Could not start scan worker"
+                        save(job)
+                    raise
                 return self.send_json(202, visible(job))
             parts = path.strip("/").split("/")
             if len(parts) == 4 and parts[:2] == ["api", "scans"] and parts[3] == "chat":
@@ -617,17 +742,30 @@ class Handler(BaseHTTPRequestHandler):
                         return self.send_json(404, {"error": "Scan not found"})
                     if job["status"] != "complete":
                         return self.send_json(409, {"error": "Wait for scan to finish"})
-                chat_job = dict(job, active_key_alias=key_alias)
-                answer = run_chat(chat_job, question, model)
-                with LOCK:
-                    job["messages"].extend([{"role": "user", "content": question, "model": model},
-                                            {"role": "assistant", "content": answer, "model": model}])
-                    job["updated_at"] = now()
-                    save(job)
-                return self.send_json(200, {"answer": answer, "messages": job["messages"]})
+                    if job["id"] in ACTIVE_CHATS:
+                        raise WorkBusy("A reply is already running for this scan")
+                    ACTIVE_CHATS.add(job["id"])
+                    chat_job = copy.deepcopy(job)
+                    chat_job["active_key_alias"] = key_alias
+                try:
+                    with model_work(key_alias):
+                        answer = run_chat(chat_job, question, model)
+                    with LOCK:
+                        updated = copy.deepcopy(job)
+                        updated["messages"].extend([{"role": "user", "content": question, "model": model},
+                                                   {"role": "assistant", "content": answer, "model": model}])
+                        updated["updated_at"] = now()
+                        save(updated)
+                        JOBS[job["id"]] = updated
+                    return self.send_json(200, {"answer": answer, "messages": updated["messages"]})
+                finally:
+                    with LOCK:
+                        ACTIVE_CHATS.discard(job["id"])
             return self.send_json(404, {"error": "Not found"})
         except (ValueError, json.JSONDecodeError) as exc:
             return self.send_json(400, {"error": str(exc)})
+        except WorkBusy as exc:
+            return self.send_json(409, {"error": str(exc)})
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
             return self.send_json(500, {"error": safe_error(str(exc))})
 
@@ -651,8 +789,8 @@ class Handler(BaseHTTPRequestHandler):
                         return self.send_json(404, {"error": "Key not found"})
                     in_use = any(job.get("key_alias") == alias and job["status"] in {"queued", "cloning", "reviewing"}
                                  for job in JOBS.values())
-                    if in_use:
-                        return self.send_json(409, {"error": "Key is used by an active scan"})
+                    if in_use or ACTIVE_KEYS.get(alias):
+                        return self.send_json(409, {"error": "Key is used by active work"})
                     delete_key(alias)
                     aliases = sorted(KEYS)
                 return self.send_json(200, {"keys": aliases})
@@ -660,21 +798,23 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 if model not in MODELS:
                     return self.send_json(404, {"error": "Model not found"})
-                MODELS.remove(model)
-                save_models()
+                updated = [item for item in MODELS if item != model]
+                save_models(updated)
+                MODELS[:] = updated
                 models = list(MODELS)
             return self.send_json(200, {"models": models})
         except (ValueError, json.JSONDecodeError) as exc:
             return self.send_json(400, {"error": str(exc)})
-        except OSError as exc:
-            return self.send_json(500, {"error": str(exc)[-500:]})
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            return self.send_json(500, {"error": safe_error(str(exc))})
 
 
 def resolve_repo_url(url):
     parsed = urlparse(url)
     parts = [p for p in parsed.path.strip("/").split("/") if p]
     if (parsed.scheme != "https" or parsed.hostname not in {"github.com", "www.github.com"}
-            or len(parts) != 2 or parsed.username or parsed.password or parsed.query or parsed.fragment):
+            or len(parts) != 2 or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or parsed.port not in (None, 443)):
         raise ValueError("Enter a public GitHub URL: https://github.com/owner/repo")
     import re
     if not all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) for p in parts):
@@ -682,6 +822,7 @@ def resolve_repo_url(url):
 
 
 if __name__ == "__main__":
+    os.umask(0o077)
     load_jobs()
     print("Open private app link: http://{}:{}/?token={}".format(HOST, PORT, SESSION_TOKEN), flush=True)
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

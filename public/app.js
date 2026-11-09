@@ -1,5 +1,12 @@
 const $ = (id) => document.getElementById(id);
+const accessToken = new URLSearchParams(location.hash.slice(1)).get('token');
+if (accessToken) {
+  sessionStorage.setItem('trace_access_token', accessToken);
+  history.replaceState(null, '', location.pathname);
+}
 let currentId = null;
+let viewGeneration = 0;
+const pendingChats = new Set();
 let pollTimer = null;
 let toastTimer = null;
 let savedModels = [];
@@ -8,7 +15,11 @@ let savedProviders = [];
 let catalogTimer = null;
 
 async function api(path, options = {}) {
-  const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
+  const response = await fetch(path, { ...options, headers: {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${sessionStorage.getItem('trace_access_token') || ''}`,
+    ...options.headers,
+  } });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
@@ -162,7 +173,9 @@ async function searchCatalog(query) {
       list.append(button);
     }
     if (!data.models.length) list.append(node('small', '', 'No matching model. You can paste an ID directly.'));
-  } catch (error) { list.replaceChildren(node('small', '', error.message)); }
+  } catch (error) {
+    if ($('catalogSearch').value.trim() === query.trim()) list.replaceChildren(node('small', '', error.message));
+  }
 }
 
 function updateKeyRows() {
@@ -171,6 +184,7 @@ function updateKeyRows() {
 }
 
 function showWelcome() {
+  viewGeneration += 1;
   currentId = null;
   clearTimeout(pollTimer);
   $('welcome').classList.remove('hidden');
@@ -253,8 +267,8 @@ function renderScan(scan) {
   $('statusPill').title = `Scan model: ${scan.model ? modelLabel(scan.model) : 'Codex default'}`;
   $('statusPill').className = `status-pill ${scan.status}`;
   const done = scan.status === 'complete';
-  $('chatInput').disabled = !done;
-  $('sendChat').disabled = !done;
+  $('chatInput').disabled = !done || pendingChats.has(scan.id);
+  $('sendChat').disabled = !done || pendingChats.has(scan.id);
   $('scanProgress').classList.toggle('hidden', done);
   $('summary').classList.toggle('hidden', !done);
   $('limitations').classList.toggle('hidden', !done);
@@ -272,6 +286,7 @@ function renderScan(scan) {
     limits.append(node('span', '', scan.report.limitations.join(' · ') || 'Confirm findings under the program rules.'));
     renderMessages(scan.messages);
   } else {
+    renderMessages(scan.messages || []);
     const title = $('scanProgress').querySelector('strong');
     const detail = $('scanProgress').querySelector('p');
     title.textContent = scan.status === 'cloning' ? 'Fetching repository' : scan.status === 'reviewing' ? 'Tracing code paths' : scan.status === 'queued' ? 'Preparing review' : 'Review stopped';
@@ -280,15 +295,22 @@ function renderScan(scan) {
   }
 }
 
-async function openScan(id) {
-  currentId = id;
+async function openScan(id, generation = null) {
+  if (generation !== null && (generation !== viewGeneration || id !== currentId)) return;
+  if (generation === null) {
+    generation = ++viewGeneration;
+    currentId = id;
+    $('chatInput').value = '';
+    renderMessages([]);
+  }
   clearTimeout(pollTimer);
   try {
     const scan = await api(`/api/scans/${id}`);
-    if (currentId !== id) return;
+    if (currentId !== id || generation !== viewGeneration) return;
     renderScan(scan);
     await loadHistory();
-    if (['queued', 'cloning', 'reviewing'].includes(scan.status)) pollTimer = setTimeout(() => openScan(id), 3000);
+    if (currentId !== id || generation !== viewGeneration) return;
+    if (['queued', 'cloning', 'reviewing'].includes(scan.status)) pollTimer = setTimeout(() => openScan(id, generation), 3000);
   } catch (error) { toast(error.message); }
 }
 
@@ -297,9 +319,11 @@ $('scanForm').addEventListener('submit', async (event) => {
   const button = $('submitScan');
   button.disabled = true;
   button.textContent = 'Starting…';
+  const generation = viewGeneration;
   try {
     const scan = await api('/api/scans', { method: 'POST', body: JSON.stringify({ url: $('repoUrl').value.trim(), focus: $('focus').value.trim(), model: $('scanModel').value, key_alias: $('scanKey').value }) });
-    await openScan(scan.id);
+    if (generation === viewGeneration) await openScan(scan.id);
+    else await loadHistory();
   } catch (error) { toast(error.message); }
   finally { button.disabled = false; button.innerHTML = 'Start scan <span>→</span>'; }
 });
@@ -308,19 +332,51 @@ $('chatForm').addEventListener('submit', async (event) => {
   event.preventDefault();
   if (!currentId) return;
   const question = $('chatInput').value.trim();
-  if (!question) return;
+  if (!question || pendingChats.has(currentId)) return;
+  const id = currentId;
+  const generation = viewGeneration;
+  const model = $('chatModel').value;
+  const keyAlias = $('chatKey').value;
+  pendingChats.add(id);
   $('chatInput').value = '';
   $('chatInput').disabled = true;
   $('sendChat').disabled = true;
-  const id = currentId;
   const thinking = { role: 'assistant', content: 'Thinking…' };
   try {
     const scan = await api(`/api/scans/${id}`);
-    renderMessages([...(scan.messages || []), { role: 'user', content: question }, thinking]);
-    const result = await api(`/api/scans/${id}/chat`, { method: 'POST', body: JSON.stringify({ message: question, model: $('chatModel').value, key_alias: $('chatKey').value }) });
-    if (currentId === id) renderMessages(result.messages);
-  } catch (error) { toast(error.message); $('chatInput').value = question; }
-  finally { if (currentId === id) { $('chatInput').disabled = false; $('sendChat').disabled = false; $('chatInput').focus(); } }
+    if (currentId === id && generation === viewGeneration) renderMessages([...(scan.messages || []), { role: 'user', content: question }, thinking]);
+    const result = await api(`/api/scans/${id}/chat`, { method: 'POST', body: JSON.stringify({ message: question, model, key_alias: keyAlias }) });
+    if (currentId === id && generation === viewGeneration) renderMessages(result.messages);
+  } catch (error) {
+    toast(error.message);
+    if (currentId === id && generation === viewGeneration) $('chatInput').value = question;
+  } finally {
+    pendingChats.delete(id);
+    if (currentId === id) {
+      $('chatInput').disabled = false;
+      $('sendChat').disabled = false;
+      if (generation === viewGeneration) $('chatInput').focus();
+      else openScan(id, viewGeneration);
+    }
+  }
+});
+
+$('downloadReport').addEventListener('click', async (event) => {
+  event.preventDefault();
+  const id = currentId;
+  if (!id) return;
+  try {
+    const response = await fetch(`/api/scans/${id}/report`, {
+      headers: { 'Authorization': `Bearer ${sessionStorage.getItem('trace_access_token') || ''}` },
+    });
+    if (!response.ok) throw new Error('Report download failed');
+    const url = URL.createObjectURL(await response.blob());
+    const download = node('a');
+    download.href = url;
+    download.download = 'security-report.md';
+    download.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) { toast(error.message); }
 });
 
 $('chatInput').addEventListener('keydown', (event) => {

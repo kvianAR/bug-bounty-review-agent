@@ -46,6 +46,7 @@ Local checkout paths also work with the CLI. The website accepts public GitHub U
 python3 -m py_compile server.py bugbounty_agent.py
 node --check public/app.js
 python3 -m unittest discover -s tests
+node --test tests/frontend.test.js
 ```
 
 The website binds to `127.0.0.1` by default and requires a random access token for API requests. It has no remote hosting. A public deployment needs a separate authenticated server that can run Git and Codex safely.
