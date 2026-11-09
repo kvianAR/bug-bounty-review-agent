@@ -5,6 +5,7 @@ if (accessToken) {
   history.replaceState(null, '', location.pathname);
 }
 let currentId = null;
+let activeScan = null;
 let viewGeneration = 0;
 const pendingChats = new Set();
 let pollTimer = null;
@@ -12,6 +13,7 @@ let toastTimer = null;
 let savedModels = [];
 let savedKeys = [];
 let savedProviders = [];
+let githubAccounts = [];
 let catalogTimer = null;
 
 async function api(path, options = {}) {
@@ -159,6 +161,16 @@ async function loadProviders() {
   renderProviders();
 }
 
+async function loadGithubAccounts() {
+  const data = await api('/api/github/accounts');
+  githubAccounts = Array.isArray(data.accounts) ? data.accounts : [];
+  const select = $('githubAccount');
+  const previous = select.value;
+  select.replaceChildren(new Option('Public repositories', ''));
+  for (const account of githubAccounts) select.add(new Option(`${account.login} · signed in`, account.login));
+  select.value = githubAccounts.some((account) => account.login === previous) ? previous : '';
+}
+
 async function searchCatalog(query) {
   const list = $('catalogResults');
   if (!query.trim()) { list.replaceChildren(); return; }
@@ -186,6 +198,7 @@ function updateKeyRows() {
 function showWelcome() {
   viewGeneration += 1;
   currentId = null;
+  activeScan = null;
   clearTimeout(pollTimer);
   $('welcome').classList.remove('hidden');
   $('workspace').classList.add('hidden');
@@ -258,6 +271,7 @@ function renderMessages(messages) {
 }
 
 function renderScan(scan) {
+  activeScan = scan;
   $('welcome').classList.add('hidden');
   $('workspace').classList.remove('hidden');
   $('crumb').textContent = repoName(scan.url);
@@ -267,6 +281,9 @@ function renderScan(scan) {
   $('statusPill').title = `Scan model: ${scan.model ? modelLabel(scan.model) : 'Codex default'}`;
   $('statusPill').className = `status-pill ${scan.status}`;
   const done = scan.status === 'complete';
+  const failed = ['failed', 'interrupted'].includes(scan.status);
+  $('deleteScan').disabled = !['complete', 'failed', 'interrupted'].includes(scan.status) || pendingChats.has(scan.id);
+  $('retryScan').classList.toggle('hidden', !failed);
   $('chatInput').disabled = !done || pendingChats.has(scan.id);
   $('sendChat').disabled = !done || pendingChats.has(scan.id);
   $('scanProgress').classList.toggle('hidden', done);
@@ -289,7 +306,7 @@ function renderScan(scan) {
     renderMessages(scan.messages || []);
     const title = $('scanProgress').querySelector('strong');
     const detail = $('scanProgress').querySelector('p');
-    title.textContent = scan.status === 'cloning' ? 'Fetching repository' : scan.status === 'reviewing' ? 'Tracing code paths' : scan.status === 'queued' ? 'Preparing review' : 'Review stopped';
+    title.textContent = scan.error_code === 'repository_access_required' ? 'Repository access required' : scan.status === 'cloning' ? 'Fetching repository' : scan.status === 'reviewing' ? 'Tracing code paths' : scan.status === 'queued' ? 'Preparing review' : 'Review stopped';
     detail.textContent = scan.error || (scan.status === 'reviewing' ? 'Codex is reviewing source. This may take several minutes.' : 'Waiting for agent…');
     $('scanProgress').querySelector('.spinner').classList.toggle('hidden', ['failed', 'interrupted'].includes(scan.status));
   }
@@ -321,7 +338,7 @@ $('scanForm').addEventListener('submit', async (event) => {
   button.textContent = 'Starting…';
   const generation = viewGeneration;
   try {
-    const scan = await api('/api/scans', { method: 'POST', body: JSON.stringify({ url: $('repoUrl').value.trim(), focus: $('focus').value.trim(), model: $('scanModel').value, key_alias: $('scanKey').value }) });
+    const scan = await api('/api/scans', { method: 'POST', body: JSON.stringify({ url: $('repoUrl').value.trim(), github_account: $('githubAccount').value, focus: $('focus').value.trim(), model: $('scanModel').value, key_alias: $('scanKey').value }) });
     if (generation === viewGeneration) await openScan(scan.id);
     else await loadHistory();
   } catch (error) { toast(error.message); }
@@ -338,6 +355,7 @@ $('chatForm').addEventListener('submit', async (event) => {
   const model = $('chatModel').value;
   const keyAlias = $('chatKey').value;
   pendingChats.add(id);
+  $('deleteScan').disabled = true;
   $('chatInput').value = '';
   $('chatInput').disabled = true;
   $('sendChat').disabled = true;
@@ -353,6 +371,7 @@ $('chatForm').addEventListener('submit', async (event) => {
   } finally {
     pendingChats.delete(id);
     if (currentId === id) {
+      $('deleteScan').disabled = false;
       $('chatInput').disabled = false;
       $('sendChat').disabled = false;
       if (generation === viewGeneration) $('chatInput').focus();
@@ -383,6 +402,32 @@ $('chatInput').addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('chatForm').requestSubmit(); }
 });
 $('newScan').addEventListener('click', showWelcome);
+$('retryScan').addEventListener('click', () => {
+  if (!activeScan) return;
+  const scan = activeScan;
+  showWelcome();
+  $('repoUrl').value = scan.url;
+  const owner = repoName(scan.url).split('/')[0];
+  const account = scan.github_account || (scan.error_code === 'repository_access_required' && githubAccounts.some((item) => item.login === owner) ? owner : '');
+  $('githubAccount').value = account;
+  $('focus').value = scan.focus || '';
+  $('scanModel').value = savedModels.includes(scan.model) ? scan.model : '';
+  $('scanKey').value = savedKeys.includes(scan.key_alias) ? scan.key_alias : '';
+  updateKeyRows();
+});
+$('deleteScan').addEventListener('click', async () => {
+  const id = currentId;
+  const generation = viewGeneration;
+  if (!id || !confirm('Delete this scan, its report, chat history, and local repository checkout?')) return;
+  $('deleteScan').disabled = true;
+  try {
+    await api(`/api/scans/${id}`, { method: 'DELETE', body: JSON.stringify({}) });
+    if (currentId === id && generation === viewGeneration) showWelcome();
+    await loadHistory();
+    toast('Scan deleted');
+  } catch (error) { toast(error.message); }
+  finally { if (currentId === id && generation === viewGeneration) $('deleteScan').disabled = false; }
+});
 $('scanModel').addEventListener('change', updateKeyRows);
 $('chatModel').addEventListener('change', updateKeyRows);
 $('modelProvider').addEventListener('change', () => {
@@ -467,3 +512,4 @@ loadHistory().catch((error) => toast(error.message));
 loadModels().catch((error) => toast(error.message));
 loadKeys().catch((error) => toast(error.message));
 loadProviders().catch((error) => toast(error.message));
+loadGithubAccounts().catch(() => { $('githubAccessNote').textContent = 'GitHub account lookup failed. Sign in with GitHub CLI to scan private repositories.'; });

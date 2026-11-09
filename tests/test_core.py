@@ -80,6 +80,56 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(180, run.call_args.kwargs["timeout"])
             self.assertEqual("0", run.call_args.kwargs["env"]["GIT_TERMINAL_PROMPT"])
 
+    def test_private_repository_failure_is_actionable(self):
+        failure = "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+        with mock.patch.object(bugbounty_agent, "bounded_process", return_value=SimpleNamespace(returncode=128, stderr=failure)):
+            with self.assertRaises(bugbounty_agent.RepositoryAccessError):
+                bugbounty_agent.resolve_repo("https://github.com/owner/private-repo", self.folder)
+        legacy = server.visible({"id": "old-scan", "status": "failed", "error": "Clone failed: " + failure})
+        self.assertEqual("repository_access_required", legacy["error_code"])
+        self.assertEqual("cloning", legacy["failed_stage"])
+        self.assertNotIn("terminal prompts", legacy["error"])
+
+    def test_private_clone_uses_selected_account_without_url_credentials(self):
+        calls = []
+        def run(command, **options):
+            calls.append((command, options))
+            if command[0] == 'gh':
+                return SimpleNamespace(returncode=0, stdout="dummy-github-token\n")
+            return SimpleNamespace(returncode=0, stderr="")
+        with mock.patch.object(bugbounty_agent, "github_accounts", return_value=[{"login": "owner"}]), \
+             mock.patch.object(bugbounty_agent, "bounded_process", side_effect=run):
+            bugbounty_agent.resolve_repo("https://github.com/owner/private-repo", self.folder, "owner")
+        command, options = calls[-1]
+        self.assertNotIn("dummy-github-token", " ".join(command))
+        self.assertIn("http.followRedirects=false", command)
+        self.assertEqual("http.https://github.com/.extraheader", options["env"]["GIT_CONFIG_KEY_0"])
+        self.assertTrue(options["env"]["GIT_CONFIG_VALUE_0"].startswith("Authorization: Basic "))
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "unrelated-token"}):
+            self.assertNotIn("GH_TOKEN", bugbounty_agent.github_cli_environment())
+
+    def test_scan_delete_removes_only_completed_scan_data(self):
+        scan_id = "a" * 12
+        job = {"id": scan_id, "status": "failed", "messages": []}
+        server.JOBS[scan_id] = job
+        server.save(job)
+        server.ACTIVE_CHATS.add(scan_id)
+        self.assertEqual(409, request("DELETE", "/api/scans/" + scan_id, {})[0])
+        self.assertTrue((self.folder / scan_id).exists())
+        server.ACTIVE_CHATS.clear()
+        self.assertEqual(200, request("DELETE", "/api/scans/" + scan_id, {})[0])
+        self.assertFalse((self.folder / scan_id).exists())
+        self.assertNotIn(scan_id, server.JOBS)
+
+    def test_private_scan_stores_account_name_only(self):
+        with mock.patch.object(server, "github_accounts", return_value=[{"login": "owner"}]), \
+             mock.patch.object(server.threading, "Thread"):
+            status, job, _ = request("POST", "/api/scans", {
+                "url": "https://github.com/owner/private-repo", "github_account": "owner"})
+        self.assertEqual(202, status)
+        self.assertEqual("owner", job["github_account"])
+        self.assertNotIn("Authorization", (self.folder / job["id"] / "job.json").read_text())
+
     def test_malformed_report_and_paths(self):
         repo = self.folder / "repo"
         repo.mkdir()

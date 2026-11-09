@@ -2,6 +2,7 @@
 """Read-only repository security review with a PR-ready report."""
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -61,7 +62,39 @@ Return JSON matching the supplied schema. Empty findings is valid.
 """
 
 
-def resolve_repo(source, temporary_root):
+class RepositoryAccessError(RuntimeError):
+    code = "repository_access_required"
+
+
+def repository_access_failure(message):
+    return any(value in message.lower() for value in (
+        "could not read username", "repository not found", "authentication failed",
+        "terminal prompts disabled", "http basic: access denied"))
+
+
+def github_cli_environment():
+    allowed = {"PATH", "HOME", "SYSTEMROOT", "XDG_CONFIG_HOME", "GH_CONFIG_DIR"}
+    return {key: value for key, value in os.environ.items() if key in allowed}
+
+
+def github_accounts():
+    if not shutil.which("gh"):
+        return []
+    result = bounded_process(["gh", "auth", "status", "--hostname", "github.com", "--json", "hosts",
+                              "--jq", '.hosts["github.com"] | map({login,active})'],
+                             env=github_cli_environment(), timeout=15)
+    try:
+        accounts = json.loads(result.stdout)
+    except ValueError:
+        return []
+    if not isinstance(accounts, list):
+        return []
+    return [{"login": account["login"], "active": bool(account.get("active"))} for account in accounts
+            if isinstance(account, dict) and isinstance(account.get("login"), str)
+            and re.fullmatch(r"[A-Za-z0-9-]{1,39}", account["login"])]
+
+
+def resolve_repo(source, temporary_root, github_account=""):
     local = Path(source).expanduser()
     if local.exists():
         if not local.is_dir():
@@ -77,12 +110,30 @@ def resolve_repo(source, temporary_root):
         raise ValueError("GitHub URL must be https://github.com/owner/repo")
     repo = Path(temporary_root) / "repo"
     url = "https://github.com/{}/{}".format(parts[0], parts[1])
+    environment = git_environment(temporary_root)
+    credential = ""
+    if github_account:
+        if not any(account["login"] == github_account for account in github_accounts()):
+            raise RepositoryAccessError("Select a GitHub account signed in through the GitHub CLI")
+        token_result = bounded_process(["gh", "auth", "token", "--hostname", "github.com", "--user", github_account],
+                                       env=github_cli_environment(), timeout=15)
+        credential = token_result.stdout.strip()
+        if token_result.returncode or not credential:
+            raise RepositoryAccessError("Could not read credentials for the selected GitHub account")
+        encoded = base64.b64encode(("x-access-token:" + credential).encode()).decode()
+        environment.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+                           GIT_CONFIG_VALUE_0="Authorization: Basic " + encoded)
     result = bounded_process(["git", "-c", "credential.helper=", "-c", "core.hooksPath=" + os.devnull,
-                             "-c", "core.fsmonitor=false", "clone", "--depth", "1",
+                             "-c", "core.fsmonitor=false", "-c", "http.followRedirects=false", "clone", "--depth", "1",
                              "--no-recurse-submodules", "--", url, str(repo)],
-                            env=git_environment(temporary_root), timeout=180)
+                            env=environment, timeout=180)
     if result.returncode:
-        raise RuntimeError("Clone failed: " + result.stderr.strip()[-500:])
+        if repository_access_failure(result.stderr):
+            raise RepositoryAccessError("GitHub access is required for this repository. Check the URL and repository visibility, or connect an account with private-repository access.")
+        detail = result.stderr.strip()
+        if credential:
+            detail = detail.replace(credential, "[redacted GitHub credential]").replace(encoded, "[redacted GitHub authorization]")
+        raise RuntimeError("Clone failed: " + detail[-500:])
     return repo, url
 
 
@@ -217,12 +268,13 @@ def main():
     parser.add_argument("repo", help="Local path or public GitHub repository URL")
     parser.add_argument("--output", type=Path, default=Path("report"), help="Report directory")
     parser.add_argument("--focus", default="all security-relevant code")
+    parser.add_argument("--github-account", default="", help="GitHub CLI account for private repositories")
     args = parser.parse_args()
     if not shutil.which("codex"):
         parser.error("Codex CLI not found in PATH")
     with tempfile.TemporaryDirectory(prefix="bugbounty-agent-") as scratch:
         try:
-            repo, source = resolve_repo(args.repo, scratch)
+            repo, source = resolve_repo(args.repo, scratch, args.github_account)
             schema = Path(scratch) / "schema.json"
             response = Path(scratch) / "response.json"
             schema.write_text(json.dumps(SCHEMA))

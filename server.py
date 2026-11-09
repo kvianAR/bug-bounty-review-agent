@@ -25,7 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
-from bugbounty_agent import PROMPT, SCHEMA, render_markdown, validate_findings, resolve_repo, normalize_report, run_codex, git_environment
+from bugbounty_agent import PROMPT, SCHEMA, render_markdown, validate_findings, resolve_repo, normalize_report, run_codex, git_environment, repository_access_failure, github_accounts
 
 
 ROOT = Path(__file__).resolve().parent
@@ -89,7 +89,12 @@ def private_write(path, content):
 
 
 def visible(job):
-    return copy.deepcopy({key: value for key, value in job.items() if key != "repo_path"})
+    result = copy.deepcopy({key: value for key, value in job.items() if key != "repo_path"})
+    if result.get("status") == "failed" and repository_access_failure(result.get("error", "")):
+        result["error_code"] = "repository_access_required"
+        result["failed_stage"] = "cloning"
+        result["error"] = "GitHub access is required for this repository. Check the URL and repository visibility, or connect an account with private-repository access."
+    return result
 
 
 def load_jobs():
@@ -221,7 +226,7 @@ def run_scan(job_id):
         with LOCK:
             job["status"] = "cloning"
             save(job)
-        repo, source_url = resolve_repo(job["url"], folder)
+        repo, source_url = resolve_repo(job["url"], folder, job.get("github_account", ""))
         schema = folder / "schema.json"
         response = folder / "response.json"
         schema.write_text(json.dumps(SCHEMA))
@@ -265,6 +270,8 @@ def run_scan(job_id):
         # A background worker must always publish a terminal state, even for malformed provider data.
         error = safe_error(str(exc))
         with LOCK:
+            job["failed_stage"] = job.get("status", "reviewing")
+            job["error_code"] = getattr(exc, "code", "scan_failed")
             job["status"] = "failed"
             job["error"] = error
             job["updated_at"] = now()
@@ -573,6 +580,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(401, {"error": "Open the private access link printed when the server starts"})
         if path == "/api/health":
             return self.send_json(200, {"ok": True})
+        if path == "/api/github/accounts":
+            try:
+                return self.send_json(200, {"accounts": github_accounts()})
+            except (OSError, RuntimeError) as exc:
+                return self.send_json(503, {"error": "GitHub account lookup failed. Check GitHub CLI sign-in."})
         if path == "/api/models":
             with LOCK:
                 models = list(MODELS)
@@ -606,7 +618,10 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 3:
                 return self.send_json(200, item)
             if len(parts) == 4 and parts[3] == "report" and job["status"] == "complete":
-                content = (DATA / job["id"] / "report.md").read_bytes()
+                try:
+                    content = (DATA / job["id"] / "report.md").read_bytes()
+                except FileNotFoundError:
+                    return self.send_json(404, {"error": "Report was deleted"})
                 self.send_response(200)
                 self.send_header("Content-Type", "text/markdown; charset=utf-8")
                 self.send_header("Content-Disposition", 'attachment; filename="security-report.md"')
@@ -698,6 +713,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/scans":
                 url = str(data.get("url", "")).strip()
                 resolve_repo_url(url)
+                github_account = str(data.get("github_account", "")).strip()
+                if github_account and not any(account["login"] == github_account for account in github_accounts()):
+                    raise ValueError("Select an available GitHub account")
                 focus = str(data.get("focus", "all security-relevant code")).strip()[:250]
                 model = str(data.get("model", "")).strip()
                 key_alias = str(data.get("key_alias", "")).strip()
@@ -708,6 +726,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("Select an API key")
                 job_id = uuid.uuid4().hex[:12]
                 job = {"id": job_id, "url": url, "focus": focus, "model": model,
+                       "github_account": github_account,
                        "key_alias": key_alias if model.startswith(("openrouter|", "custom|")) else "",
                        "status": "queued", "created_at": now(), "updated_at": now(),
                        "messages": []}
@@ -778,10 +797,29 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
             return self.send_json(415, {"error": "JSON required"})
         path = urlparse(self.path).path
-        if path not in {"/api/models", "/api/keys"}:
+        scan_parts = path.strip("/").split("/")
+        deleting_scan = len(scan_parts) == 3 and scan_parts[:2] == ["api", "scans"]
+        if path not in {"/api/models", "/api/keys"} and not deleting_scan:
             return self.send_json(404, {"error": "Not found"})
         try:
             body = self.body_json()
+            if deleting_scan:
+                scan_id = scan_parts[2]
+                with LOCK:
+                    job = JOBS.get(scan_id)
+                    if not job:
+                        return self.send_json(404, {"error": "Scan not found"})
+                    if job["status"] in {"queued", "cloning", "reviewing"} or scan_id in ACTIVE_CHATS:
+                        return self.send_json(409, {"error": "Wait for this scan or chat to finish before deleting"})
+                    if not re.fullmatch(r"[a-f0-9]{12}", scan_id):
+                        raise ValueError("Invalid scan ID")
+                    folder = DATA / scan_id
+                    if folder.is_symlink():
+                        raise ValueError("Scan directory must not be a symbolic link")
+                    if folder.exists():
+                        shutil.rmtree(folder)
+                    del JOBS[scan_id]
+                return self.send_json(200, {"deleted": scan_id})
             if path == "/api/keys":
                 alias = str(body.get("alias", "")).strip()
                 with LOCK:

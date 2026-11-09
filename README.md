@@ -1,6 +1,6 @@
 # Trace: bug bounty repository review
 
-Trace is a local website for reviewing public GitHub repositories. Paste a link, see candidate security findings, ask follow-up questions in chat, and download a PR-ready report.
+Trace is a local website for reviewing public and authorized private GitHub repositories. Paste a link, see candidate security findings, ask follow-up questions in chat, and download a PR-ready report.
 
 Built by [kvianAR](https://github.com/kvianAR).
 
@@ -12,11 +12,11 @@ Requirements: Python 3.9+, Git, and the [Codex CLI](https://developers.openai.co
 python3 server.py
 ```
 
-Open the private access link printed by the server. Paste a public GitHub repository URL. A review may take several minutes. Scans and chat are saved under `data/`, which Git ignores. Set `BUGBOUNTY_PORT` to change the port. A new access link is generated on each restart; keep it private.
+Open the private access link printed by the server. Paste a GitHub repository URL. For private repositories, choose an account under **GitHub access**. Accounts come from `gh auth login`; the app preserves the active GitHub CLI account. Repository source is sent to your selected model provider. A review may take several minutes. Scans and chat are saved under `data/`, which Git ignores. Set `BUGBOUNTY_PORT` to change the port. A new access link is generated on each restart; keep it private.
 
 ## How it works
 
-1. The app validates a public GitHub URL and clones a shallow checkout into `data/`.
+1. The app validates a GitHub URL and clones a shallow checkout into `data/`. Private access uses the explicitly selected GitHub CLI account. Its credential is passed to Git in the child environment and is excluded from clone URLs, scan records, and model calls.
 2. Codex runs in read-only mode against that checkout and returns structured findings.
 3. The app checks each finding's path and line, then renders evidence, impact, safe reproduction, suggested fix, and PR checklist.
 4. Chat uses the same checkout and report as context. Report download produces Markdown.
@@ -38,7 +38,9 @@ For a terminal-only review:
 python3 bugbounty_agent.py https://github.com/owner/repository --output report
 ```
 
-Local checkout paths also work with the CLI. The website accepts public GitHub URLs only.
+Local checkout paths also work with the CLI. Add `--github-account LOGIN` to use an account signed in through GitHub CLI for private repositories.
+
+Failed scans explain repository-access errors and offer **Edit repository and retry**. Open a completed, failed, or interrupted scan to use **Delete scan**. Deletion removes its checkout, report, and chat after confirmation. Running scans and active replies must finish first.
 
 ## Development checks
 

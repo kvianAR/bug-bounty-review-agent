@@ -57,7 +57,7 @@ async function harness() {
   let timerId = 0;
   let fetchHandler = async (url) => {
     const defaults = { '/api/scans': { scans: [] }, '/api/models': { models: [] },
-      '/api/keys': { keys: [] }, '/api/providers': { providers: [] } };
+      '/api/keys': { keys: [] }, '/api/providers': { providers: [] }, '/api/github/accounts': { accounts: [] } };
     return response(defaults[url] || job('A'));
   };
   const storage = new Map();
@@ -71,7 +71,7 @@ async function harness() {
     fetch: (...args) => fetchHandler(...args),
     setTimeout: (callback, delay) => { timers.set(++timerId, { callback, delay }); return timerId; },
     clearTimeout: (id) => timers.delete(id),
-    URL, URLSearchParams, console,
+    URL, URLSearchParams, console, confirm: () => true,
   });
   const source = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
   vm.runInContext(source, context);
@@ -150,4 +150,45 @@ test('pasted free model stays exact with floor box checked', async () => {
   });
   await app.get('modelForm').listeners.submit({ preventDefault() {} });
   assert.equal(sent.id, id);
+});
+
+test('failed repository scan explains access and restores review settings', async () => {
+  const app = await harness();
+  app.run("savedModels = ['openrouter|fixture/model:free']; savedKeys = ['fixture-key']");
+  app.context.failedFixture = { ...job('private', 'failed'), error_code: 'repository_access_required',
+    error: 'GitHub access is required', focus: 'auth', model: 'openrouter|fixture/model:free', key_alias: 'fixture-key' };
+  app.run('renderScan(failedFixture)');
+  assert.equal(app.get('scanProgress').querySelector('strong').textContent, 'Repository access required');
+  assert.equal(app.get('retryScan').classes.has('hidden'), false);
+  app.get('retryScan').listeners.click();
+  assert.equal(app.get('repoUrl').value, 'https://github.com/owner/private');
+  assert.equal(app.get('scanModel').value, 'openrouter|fixture/model:free');
+  assert.equal(app.get('scanKey').value, 'fixture-key');
+  assert.equal(app.run('currentId'), null);
+});
+
+test('scan form sends the chosen GitHub account', async () => {
+  const app = await harness();
+  app.get('repoUrl').value = 'https://github.com/owner/private';
+  app.get('githubAccount').value = 'owner';
+  let sent;
+  app.setFetch(async (url, options) => {
+    if (options.method === 'POST') { sent = JSON.parse(options.body); return response(job('private')); }
+    return response(url === '/api/scans' ? { scans: [] } : job('private'));
+  });
+  await app.get('scanForm').listeners.submit({ preventDefault() {} });
+  assert.equal(sent.github_account, 'owner');
+});
+
+test('confirmed scan deletion clears the selected view and history', async () => {
+  const app = await harness();
+  app.run("currentId = 'aaaaaaaaaaaa'; viewGeneration = 1");
+  let deletion;
+  app.setFetch(async (url, options) => {
+    if (options.method === 'DELETE') deletion = url;
+    return response(options.method === 'DELETE' ? { deleted: 'aaaaaaaaaaaa' } : { scans: [] });
+  });
+  await app.get('deleteScan').listeners.click();
+  assert.equal(deletion, '/api/scans/aaaaaaaaaaaa');
+  assert.equal(app.run('currentId'), null);
 });

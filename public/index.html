@@ -31,27 +31,31 @@
       <section id="welcome" class="welcome view">
         <div class="hero-eyebrow"><span class="eyebrow-line"></span> SECURITY REVIEW WORKSPACE <span class="version">v0.1</span></div>
         <h1>Know the code.<br><em>Find the risk.</em></h1>
-        <p class="hero-copy">Paste a public GitHub repository. Trace reviews the source, surfaces evidence-backed candidates, and helps you turn findings into clear fixes.</p>
+        <p class="hero-copy">Paste a GitHub repository. Trace reviews the source, surfaces evidence-backed candidates, and helps you turn findings into clear fixes.</p>
         <form id="scanForm" class="scan-card">
           <div class="card-top"><span class="scan-card-icon">⌁</span><span>START A REVIEW</span><span class="read-only">READ ONLY</span></div>
           <label for="repoUrl">GitHub repository URL</label>
           <div class="input-wrap"><span class="input-prefix">↳</span><input id="repoUrl" name="url" type="url" required placeholder="https://github.com/owner/repository" autocomplete="url"><span class="input-end">↗</span></div>
+          <label for="githubAccount">GitHub access</label>
+          <div class="model-row"><select id="githubAccount"><option value="">Public repositories</option></select></div>
+          <p id="githubAccessNote" class="access-note">For a private repository, choose an account with access. Its source is shared with your selected model provider.</p>
           <label for="focus">Review focus <span class="optional">optional</span></label>
           <input id="focus" class="focus-input" name="focus" type="text" maxlength="250" placeholder="All security-relevant code">
           <label for="scanModel" class="model-label">Scan model</label>
           <div class="model-row"><select id="scanModel" aria-label="Scan model"><option value="">Codex default</option></select><button type="button" class="add-model-inline" id="addModelInline">+ Add model</button></div>
           <div id="scanKeyRow" class="key-row hidden"><label for="scanKey">Provider API key</label><select id="scanKey"><option value="">Select key</option></select><small>Repository content goes to your chosen provider. Your selected key pays for usage.</small></div>
-          <div class="card-footer"><span><i class="shield-icon">◇</i> Public repos only · No live target requests</span><button type="submit" id="submitScan">Start scan <span>→</span></button></div>
+          <div class="card-footer"><span><i class="shield-icon">◇</i> Source review · No live target requests</span><button type="submit" id="submitScan">Start scan <span>→</span></button></div>
         </form>
         <div class="steps"><div><span>01 /</span><strong>Connect</strong><p>Paste the repository URL.</p></div><div><span>02 /</span><strong>Investigate</strong><p>Agent traces security-relevant code.</p></div><div><span>03 /</span><strong>Resolve</strong><p>Review evidence, ask questions, plan the PR.</p></div></div>
       </section>
 
       <section id="workspace" class="workspace view hidden">
-        <div class="workspace-header"><div><span class="hero-eyebrow"><span class="eyebrow-line"></span> ACTIVE REVIEW</span><h2 id="repoName">Repository</h2><a id="repoLink" href="#" target="_blank" rel="noopener noreferrer">View repository ↗</a></div><div id="statusPill" class="status-pill">Queued</div></div>
+        <div class="workspace-header"><div><span class="hero-eyebrow"><span class="eyebrow-line"></span> ACTIVE REVIEW</span><h2 id="repoName">Repository</h2><a id="repoLink" href="#" target="_blank" rel="noopener noreferrer">View repository ↗</a></div><div class="workspace-actions"><div id="statusPill" class="status-pill">Queued</div><button type="button" id="deleteScan" class="delete-scan">Delete scan</button></div></div>
         <div class="workspace-grid">
           <div class="review-column">
             <div class="panel-heading"><span>REVIEW OUTPUT</span><span id="findingCount">—</span></div>
             <div id="scanProgress" class="progress-panel"><div class="spinner"></div><div><strong>Preparing review</strong><p>Waiting for agent…</p></div></div>
+            <button type="button" id="retryScan" class="retry-scan hidden">Edit repository and retry</button>
             <div id="summary" class="summary hidden"></div>
             <div id="findings" class="findings"></div>
             <div id="limitations" class="limitations hidden"></div>
