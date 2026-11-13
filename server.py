@@ -673,8 +673,14 @@ def custom_completion(model, key_alias, messages, timeout, max_output_tokens=Non
         body_data[token_field] = max_output_tokens
     if model.startswith("openrouter|"):
         body_data["usage"] = {"include": True}
+        # Reasoning shares the completion limit. Leave room for the final report.
+        if max_output_tokens is not None:
+            body_data["reasoning"] = {"max_tokens": min(1024, max_output_tokens // 4)}
+        else:
+            body_data["reasoning"] = {"enabled": False}
+        body_data.setdefault("provider", {})["require_parameters"] = True
         if price_limits:
-            body_data["provider"] = {"max_price": {"prompt": price_limits["input"], "completion": price_limits["output"]}}
+            body_data["provider"]["max_price"] = {"prompt": price_limits["input"], "completion": price_limits["output"]}
     payload = json.dumps(body_data).encode()
     connection = PublicHTTPSConnection(host, port, addresses, timeout)
     expired = threading.Event()
@@ -721,9 +727,18 @@ def custom_completion(model, key_alias, messages, timeout, max_output_tokens=Non
         usage = data.get("usage", {}) if isinstance(data, dict) else {}
         usage_callback(usage if isinstance(usage, dict) else {})
     try:
-        content = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        content = choice["message"].get("content")
+        if isinstance(content, list):
+            content = "\n".join(part["text"] for part in content
+                                if isinstance(part, dict) and part.get("type") == "text"
+                                and isinstance(part.get("text"), str))
         if isinstance(content, str) and content.strip():
             return content.strip().replace(key, "[redacted key]")
+        if choice.get("finish_reason") == "length":
+            raise RuntimeError("Model exhausted its output-token limit before returning a final answer. Increase the output-token limit or choose another model.")
+        if choice.get("finish_reason") == "content_filter":
+            raise RuntimeError("Provider filtered the response. Choose another model for this review.")
     except (KeyError, IndexError, TypeError):
         pass
     raise RuntimeError("Provider returned no text content")

@@ -295,6 +295,21 @@ class CoreTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 server.test_model(model, "fixture")
 
+    def test_openrouter_reasoning_leaves_room_for_final_answer(self):
+        server.KEYS["fixture"] = "dummy-test-key"
+        connection = mock.Mock()
+        response = {"choices": [{"message": {"content": [{"type": "text", "text": "final report"}]}}]}
+        connection.getresponse.return_value = SimpleNamespace(status=200, read=lambda size: json.dumps(response).encode())
+        with mock.patch.object(server, "validate_endpoint", return_value=("openrouter.ai", 443, "/api/v1/chat/completions", ["8.8.8.8"])), \
+             mock.patch.object(server, "PublicHTTPSConnection", return_value=connection):
+            self.assertEqual("final report", server.custom_completion("openrouter|fixture/model:floor", "fixture", [], 1, max_output_tokens=5000))
+            sent = json.loads(connection.request.call_args.kwargs["body"])
+            self.assertEqual({"max_tokens": 1024}, sent["reasoning"])
+            self.assertTrue(sent["provider"]["require_parameters"])
+            response["choices"][0] = {"message": {"content": None, "reasoning": "internal analysis"}, "finish_reason": "length"}
+            with self.assertRaisesRegex(RuntimeError, "output-token limit"):
+                server.custom_completion("openrouter|fixture/model:floor", "fixture", [], 1, max_output_tokens=5000)
+
     def test_deadline_closes_socket_owned_by_connection_close_response(self):
         server.KEYS["fixture"] = "dummy-test-key"
         aborted = threading.Event()
