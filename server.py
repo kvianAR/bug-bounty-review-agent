@@ -6,6 +6,7 @@ import copy
 import http.client
 import ipaddress
 import os
+import errno
 import re
 import secrets
 import shutil
@@ -1248,6 +1249,14 @@ def parse_scan_target(url):
 
 if __name__ == "__main__":
     os.umask(0o077)
-    load_jobs()
-    print("Open private app link: http://{}:{}/?token={}".format(HOST, PORT, SESSION_TOKEN), flush=True)
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    try:
+        http_server = ThreadingHTTPServer((HOST, PORT), Handler)
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        print("Port {} is already in use. Trace may already be running. Use its existing private access link, or stop that server before starting again.".format(PORT), file=sys.stderr)
+        sys.exit(1)
+    with http_server:
+        load_jobs()
+        print("Open private app link: http://{}:{}/?token={}".format(HOST, PORT, SESSION_TOKEN), flush=True)
+        http_server.serve_forever()
