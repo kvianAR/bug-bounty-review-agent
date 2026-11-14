@@ -226,7 +226,11 @@ Request at most six actions per round. Read any part of a file, including after 
 
 
 def investigation_response(text):
-    value = json_object(text)
+    try:
+        value = json_object(text)
+    except (ValueError, RecursionError):
+        # A prose-only navigation reply can end navigation, never approve a finding.
+        return {"requests": [], "notes": "Unstructured navigation notes; verify every claim against source. " + workflow.redact_source(text[:3000])}
     requests = value.get("requests", [])
     notes = value.get("notes", value.get("reason", value.get("summary", "")))
     if not isinstance(requests, list) or len(requests) > MAX_ACTIONS or not isinstance(notes, str):

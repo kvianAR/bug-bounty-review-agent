@@ -24,6 +24,13 @@ class AccuracyTests(unittest.TestCase):
         self.repository = accuracy.Repository(self.root, 10000)
         self.repository.manifest()
 
+    def test_prose_navigation_reply_does_not_approve_a_finding(self):
+        value = accuracy.investigation_response("No more source requests needed.")
+        self.assertEqual([], value['requests'])
+        self.assertNotIn('verdict', value)
+        with self.assertRaises(ValueError):
+            accuracy.check_assessment(self.repository, "Looks confirmed")
+
     def test_review_json_accepts_explanation_and_fenced_object(self):
         value = accuracy.json_object('Review result\n```JSON\n{"verdict":"rejected"}\n```')
         self.assertEqual('rejected', value['verdict'])
