@@ -210,6 +210,10 @@ def check_assessment(repository, text):
             continue
     effect = value.get('security_effect', 'unknown')
     impact_scope = value.get('impact_scope', 'unknown')
+    if not isinstance(effect, str):
+        effect = 'unknown'
+    if not isinstance(impact_scope, str):
+        impact_scope = 'unknown'
     fields = ('attacker', 'entry_point', 'violated_control', 'unauthorized_effect')
     boundary = {name: value.get(name, '') for name in fields}
     if verdict in {'supported', 'rejected', 'hardening'} and not checked:

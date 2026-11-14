@@ -33,6 +33,9 @@ class AccuracyTests(unittest.TestCase):
                  'citations': [{'path': 'service.py', 'line': 302, 'quote': 'name.strip()[:120]'}]}
         result = accuracy.check_assessment(self.repository, json.dumps(value))
         self.assertEqual('hardening', result['verdict'])
+        value['security_effect'] = []
+        value['impact_scope'] = {}
+        self.assertEqual('needs_validation', accuracy.check_assessment(self.repository, json.dumps(value))['verdict'])
 
     def test_prose_navigation_reply_does_not_approve_a_finding(self):
         value = accuracy.investigation_response("No more source requests needed.")

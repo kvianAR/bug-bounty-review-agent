@@ -522,6 +522,7 @@ def source_supported(finding):
     effect = source.get("security_effect")
     scope = source.get("impact_scope")
     return bool(source.get("verdict") == "supported" and source.get("citations")
+                and isinstance(effect, str) and isinstance(scope, str)
                 and all(isinstance(source.get(field), str) and source[field].strip()
                         for field in ("attacker", "entry_point", "violated_control", "unauthorized_effect"))
                 and effect in {"unauthorized_read", "unauthorized_write", "privilege_escalation", "code_execution",
