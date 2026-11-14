@@ -93,6 +93,8 @@ class WorkflowTests(unittest.TestCase):
                  "commit": self.commit, "status": "complete", "created_at": "2026-11-09T00:00:00+00:00",
                  "messages": [], "report": report([item]), "model": "openrouter|fixture/primary:free",
                  "key_alias": "primary", "policy": workflow.budget_policy({"max_cost_usd": 0})}
+        item["source_review"] = {"verdict": "supported", "reason": "Fixture public path reaches the file helper"}
+        item["regression_review"] = {"verdict": "supported", "reason": "Fixture test exercises the real helper"}
         server.JOBS[value["id"]] = value
         server.KEYS["primary"] = "dummy-primary-key"
         server.save(value)
@@ -234,7 +236,8 @@ class WorkflowTests(unittest.TestCase):
             server.run_workflow(job["id"], item["id"], "prepare", job["model"], job["key_alias"])
         self.assertEqual("complete", job["operation"]["status"])
         self.assertTrue(item["remediation"]["valid"])
-        with mock.patch.object(workflow, "verify_plan", return_value={"status": "reproduced", "reason": "Fixture proof"}):
+        with mock.patch.object(server.accuracy_review, "review_regression", return_value={"verdict": "supported", "reason": "Fixture real entry point checked"}), \
+             mock.patch.object(workflow, "verify_plan", return_value={"status": "reproduced", "reason": "Fixture proof"}):
             server.run_workflow(job["id"], item["id"], "verify", "", "")
         status, document, _ = request("GET", f'/api/scans/{job["id"]}/findings/{item["id"]}/pr')
         self.assertEqual(200, status)

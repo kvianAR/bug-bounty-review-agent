@@ -241,6 +241,20 @@ def run_codex(prompt, response, model="", schema=None, timeout=1800):
         return bounded_process(command + [prompt], env=environment, timeout=timeout)
 
 
+def parse_report(answer):
+    body = answer.strip()
+    if body.startswith("```"):
+        body = re.sub(r"^```(?:json)?\s*|\s*```$", "", body)
+    start, end = body.find("{"), body.rfind("}")
+    if start < 0 or end < start:
+        raise RuntimeError("Model did not return a JSON report")
+    try:
+        report = json.loads(body[start:end + 1])
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise RuntimeError("Model returned invalid report JSON") from exc
+    return normalize_report(report)
+
+
 def validate_findings(data, repo):
     data = normalize_report(data)
     checked = []
@@ -308,6 +322,13 @@ def render_markdown(data, source, commit):
                     "- Impact: {}".format(item["impact"]),
                     "- Safe reproduction: {}".format(item["reproduction"]),
                     "- Suggested fix: {}".format(item["fix"]), "", "PR checklist:", ""])
+        assessment = item.get("source_review") or item.get("assessment") or {}
+        out.extend(["", "Review status: " + assessment.get("verdict", "legacy_unverified"),
+                    assessment.get("reason", "A fresh source investigation is required."),
+                    "Runtime verification: " + item.get("verification", {}).get("status", "not_run"),
+                    "Regression meaning review: " + item.get("regression_review", {}).get("verdict", "pending"), ""])
+        for citation in assessment.get("citations", []):
+            out.append("- Reviewed source `{}:{}`. `{}`".format(citation["path"], citation["line"], citation["quote"].replace("`", "'")))
         out.extend("- [ ] " + step for step in item["pr_checklist"])
         out.append("")
     out.extend(["## Limits", ""])

@@ -76,3 +76,52 @@ node --check public/workflow-ui.js
 python3 -m unittest discover -s tests
 node --test tests/frontend.test.js
 ```
+
+## Investigative reviews and evidence gates
+
+New scans build a repository map of declarations, imports and route hints. The model can request bounded source ranges anywhere in supported files and literal searches for helpers and callers. Discovery and candidate investigation each allow up to three rounds of six actions. Reads are capped at 160 lines, files at 250 KB, and searches at 8 MB of source and 35 hits per action. The manifest is bounded and marks its limits. Source access stays inside the checkout and never executes repository code.
+
+The reviewer traces auth, ownership, helper validation, storage and deployment assumptions. Every accepted or rejected source verdict requires an exact citation to source that was supplied. A supported candidate also requires an attacker, entry point, violated control and unauthorized effect. Missing evidence becomes `needs_validation`. Hardening and rejected findings are retained and hidden by default. Enable their checkbox to inspect them.
+
+Choose **Independent reviewer** and its key in the advanced scan settings to use another saved model. The default uses the scan model with a fresh context. Both review routes share workspace cost limits and their calls appear in usage. A fresh context from the same model is not independent empirical confirmation. At most eight discovered candidates receive review per run.
+
+PR readiness now requires all three gates.
+
+1. Source review supports the claimed security boundary.
+2. A separate regression review checks that the test exercises the real entry point, relevant auth/ownership controls and security assertion. Toy reimplementations and tests that bypass the control need validation.
+3. Isolated execution fails on original source and passes with the patch using expected markers.
+
+Older scans need a fresh investigative review before they can pass these gates. A model's semantic review and an automated regression still require a human assessment of disclosure impact.
+
+## Static tools and application test runtimes
+
+Enable **Run isolated Semgrep leads** to run the app-owned rules offline in a restricted container. Cache the official tool image first.
+
+```bash
+docker pull semgrep/semgrep:1.143.0
+```
+
+The runner ignores repository-provided Semgrep configurations and treats all alerts as unverified leads. An unavailable tool or exceeded limit is shown in coverage. The small bundled rules cover shell execution, dynamic evaluation and disabled TLS checks. They do not provide comprehensive language or vulnerability coverage.
+
+Upload **SARIF 2.1.0** from Semgrep or CodeQL in the scan form to add external analyzer leads. Relative paths must match the scanned checkout. Use output from the same commit. Imports are capped at 600 KB in the browser and 100 retained leads. Trace does not execute CodeQL's project build scripts. Generate its database and SARIF in an environment authorized for that repository. See the [CodeQL CLI documentation](https://docs.github.com/en/code-security/codeql-cli) and [Semgrep documentation](https://semgrep.dev/docs/).
+
+Two optional runtimes support tests that import real web application libraries or drive a browser.
+
+```bash
+docker build -f tools/python-review.Dockerfile -t trace-python-review:latest tools
+docker build -f tools/browser-review.Dockerfile -t trace-browser-review:latest tools
+```
+
+Select `python-app` or `browser` in an editable regression plan. Python app includes pinned FastAPI, HTTPX, pytest, SQLAlchemy and Redis packages. Browser includes pinned Playwright and Chromium. These dependencies may differ from a target's requirements. All test runs keep the same offline container restrictions. Browser runs allow 1 GB RAM, 128 processes, 128 MB temporary storage and a 64 MB per-file write ceiling so Chromium can start. Other runtimes retain their smaller limits. Browser tests may start a local fixture service inside that container and must use its own loopback address. Required remote services or missing target dependencies lead to a blocked result. Burp Suite remains an external manual tool for authorized request inspection.
+
+## Accuracy benchmark
+
+`accuracy_benchmark.py` provides eight small synthetic cases, including vulnerable/fixed authorization, SQL injection and HTML rendering pairs, plus self-only input and admin-output negatives. Ground truth stays outside the repository shown to the model. Tests verify the fixtures' behavior separately from model predictions.
+
+Run a live evaluation with an explicit model, key alias and total estimated cost ceiling.
+
+```bash
+python3 accuracy_benchmark.py --model 'openrouter|provider/model:free' --key-alias 'Your saved key name' --max-cost-usd 0 --output benchmark-results.json
+```
+
+Add `--publish` to display the live benchmark summary in the website. Use `TRACE_BENCHMARK_KEY` for a temporary key, `--case case_07` for one case, or `--predictions predictions.json` to score existing decisions. Output includes precision, recall, false-positive rate, abstentions, decision coverage, raw reviewed findings and usage. Positive abstentions count as recall misses. False-positive rate is calculated among decided negative cases. Undefined metrics remain null. This benchmark measures a small synthetic source-review task and cannot establish real-world bounty accuracy.

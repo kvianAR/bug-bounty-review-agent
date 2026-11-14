@@ -45,9 +45,13 @@
           <div class="model-row"><select id="scanModel" aria-label="Scan model"><option value="">Codex default</option></select><button type="button" class="add-model-inline" id="addModelInline">+ Add model</button></div>
           <div id="scanKeyRow" class="key-row hidden"><label for="scanKey">Provider API key</label><select id="scanKey"><option value="">Select key</option></select><small>Repository content goes to your chosen provider. Your selected key pays for usage.</small></div>
           <details class="advanced-scan"><summary>Scope, budget & fallback models</summary>
-            <label for="baseScan">Compare with a previous scan</label><select id="baseScan"><option value="">Full repository review</option></select>
+            <div class="policy-grid"><div><label for="reviewModel">Independent reviewer</label><select id="reviewModel"><option value="__scan__">Use scan model with fresh context</option></select></div><div><label for="reviewKey">Reviewer API key</label><select id="reviewKey"><option value="__scan__">Use scan key</option></select></div></div>
+        <p class="field-help">Reviews trace callers and helpers before accepting candidates. Each investigation and review uses your workspace budget.</p>
+        <label><input id="useSemgrep" type="checkbox"> Run isolated Semgrep leads (requires cached tool image)</label>
+        <label for="analysisSarif">Semgrep / CodeQL evidence (optional SARIF 2.1.0, up to 600 KB)</label><input id="analysisSarif" type="file" accept=".sarif,.json"><p class="field-help">Analyzer alerts are investigated as leads. Source review and runtime proof determine readiness.</p>
+        <label for="baseScan">Compare with a previous scan</label><select id="baseScan"><option value="">Full repository review</option></select>
             <p class="field-help">A GitHub PR URL compares its base and head automatically. A baseline scan reviews changed files only.</p>
-            <div id="scanPolicyFields"></div>
+            <p id="accuracyBenchmark" class="field-help">No live accuracy benchmark recorded yet.</p><div id="scanPolicyFields"></div>
           </details>
           <div class="card-footer"><span><i class="shield-icon">◇</i> Source review · No live target requests</span><button type="submit" id="submitScan">Start scan <span>→</span></button></div>
         </form>
@@ -58,7 +62,7 @@
         <div class="workspace-header"><div><span class="hero-eyebrow"><span class="eyebrow-line"></span> ACTIVE REVIEW</span><h2 id="repoName">Repository</h2><a id="repoLink" href="#" target="_blank" rel="noopener noreferrer">View repository ↗</a></div><div class="workspace-actions"><div id="statusPill" class="status-pill">Queued</div><button type="button" id="deleteScan" class="delete-scan">Delete scan</button></div></div>
         <div id="workflowOverview" class="workflow-overview"></div>
         <div id="operationStatus" class="operation-status hidden" role="status"></div>
-        <div class="review-settings"><div><label for="repairModel">Fix-draft model</label><select id="repairModel"><option value="__scan__">Use scan model</option></select></div><div><label for="repairKey">Fix-draft API key</label><select id="repairKey"><option value="__scan__">Use scan key</option></select></div><label class="show-dismissed"><input id="showDismissed" type="checkbox"> Show dismissed findings</label></div>
+        <div class="review-settings"><div><label for="repairModel">Fix-draft model</label><select id="repairModel"><option value="__scan__">Use scan model</option></select></div><div><label for="repairKey">Fix-draft API key</label><select id="repairKey"><option value="__scan__">Use scan key</option></select></div><label class="show-dismissed"><input id="showDismissed" type="checkbox"> Show rejected, hardening and dismissed findings</label></div>
         <details id="coveragePanel" class="insight-panel"><summary>Coverage & changes</summary><div id="coverageContent"></div></details>
         <details id="usagePanel" class="insight-panel"><summary>Budget, usage & model attempts</summary><div id="usageContent"></div><button type="button" id="editBudget" class="secondary-button">Edit budget & fallback routes</button></details>
         <div class="workspace-grid">
@@ -69,7 +73,7 @@
             <div id="summary" class="summary hidden"></div>
             <div id="findings" class="findings"></div>
             <div id="limitations" class="limitations hidden"></div>
-            <a id="downloadReport" class="download hidden" href="#" download>↓ Download PR-ready report</a>
+            <a id="downloadReport" class="download hidden" href="#" download>↓ Download review report</a>
           </div>
           <div class="chat-column"><div class="panel-heading"><span>ASK TRACE</span><span class="chat-status"><i></i> REPO CONTEXT</span></div><div id="messages" class="messages"><div class="assistant-message"><div class="avatar">T</div><div class="message-body"><small>TRACE AGENT</small><p>Start a scan, then ask about findings, attack paths, fixes, or what to test before a PR.</p></div></div></div><form id="chatForm" class="chat-form"><div class="chat-model-row"><label for="chatModel">CHAT MODEL</label><select id="chatModel"><option value="">Codex default</option></select></div><div id="chatKeyRow" class="chat-model-row hidden"><label for="chatKey">API KEY</label><select id="chatKey"><option value="">Select key</option></select></div><textarea id="chatInput" placeholder="Ask about this repository…" rows="2" disabled></textarea><div><span>Enter to send · Shift+Enter for new line</span><button type="submit" id="sendChat" disabled aria-label="Send message">↑</button></div></form></div>
         </div>

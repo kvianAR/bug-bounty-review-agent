@@ -300,10 +300,10 @@ function renderScan(scan) {
   $('findingCount').textContent = done ? `${scan.report.findings.length} CANDIDATE${scan.report.findings.length === 1 ? '' : 'S'}` : '—';
   if (done) {
     $('summary').replaceChildren(node('strong', '', 'REVIEW SUMMARY'), node('span', '', scan.report.summary));
-    const findings = scan.report.findings.filter((finding) => $('showDismissed').checked || !['dismissed', 'rejected'].includes(finding.triage?.decision));
+    const findings = scan.report.findings.filter((finding) => $('showDismissed').checked || (!['dismissed', 'rejected'].includes(finding.triage?.decision) && !['rejected', 'hardening'].includes(finding.accuracy_status || finding.assessment?.verdict)));
     const hidden = scan.report.findings.length - findings.length;
-    $('findingCount').textContent = `${scan.report.findings.length} CANDIDATE${scan.report.findings.length === 1 ? '' : 'S'}${hidden ? ` · ${hidden} dismissed hidden` : ''}`;
-    if (!findings.length) $('findings').append(node('div', 'summary', hidden ? 'Saved decisions hide these findings. Enable Show dismissed findings to review them.' : 'No source-backed candidate findings in this scan. This does not prove the repository is secure.'));
+    $('findingCount').textContent = `${findings.filter((finding) => finding.pr?.ready).length} VERIFIED · ${findings.filter((finding) => !finding.pr?.ready).length} UNVERIFIED${hidden ? ` · ${hidden} hidden` : ''}`;
+    if (!findings.length) $('findings').append(node('div', 'summary', hidden ? 'Saved decisions hide these findings. Enable Show rejected, hardening and dismissed findings to review them.' : 'No source-backed candidate findings in this scan. This does not prove the repository is secure.'));
     for (const finding of findings) $('findings').append(renderFinding(finding));
     const limits = $('limitations');
     limits.replaceChildren(node('strong', '', 'LIMITS  '));
@@ -347,7 +347,15 @@ $('scanForm').addEventListener('submit', async (event) => {
   button.textContent = 'Starting…';
   const generation = viewGeneration;
   try {
-    const scan = await api('/api/scans', { method: 'POST', body: JSON.stringify({ url: $('repoUrl').value.trim(), github_account: $('githubAccount').value, focus: $('focus').value.trim(), model: $('scanModel').value, key_alias: $('scanKey').value, base_scan: $('baseScan').value, policy: readWorkflowPolicy('scan') }) });
+    let analysisSarif = null;
+    const sarifFile = $('analysisSarif').files?.[0];
+    if (sarifFile) {
+      if (sarifFile.size > 600000) throw new Error('SARIF upload must be smaller than 600 KB');
+      analysisSarif = JSON.parse(await sarifFile.text());
+    }
+    const reviewModel = $('reviewModel').value === '__scan__' ? $('scanModel').value : $('reviewModel').value;
+    const reviewKey = $('reviewKey').value === '__scan__' ? $('scanKey').value : $('reviewKey').value;
+    const scan = await api('/api/scans', { method: 'POST', body: JSON.stringify({ review_model: reviewModel, review_key: reviewKey, analysis_sarif: analysisSarif, use_semgrep: $('useSemgrep').checked, url: $('repoUrl').value.trim(), github_account: $('githubAccount').value, focus: $('focus').value.trim(), model: $('scanModel').value, key_alias: $('scanKey').value, base_scan: $('baseScan').value, policy: readWorkflowPolicy('scan') }) });
     if (generation === viewGeneration) await openScan(scan.id);
     else await loadHistory();
   } catch (error) { toast(error.message); }

@@ -44,6 +44,8 @@ function fillChoices(select, choices) {
 }
 
 function renderWorkflowChoices() {
+  fillChoices($('reviewModel'), [['Use scan model with fresh context', '__scan__'], ['Codex default', ''], ...savedModels.map((model) => [modelLabel(model), model])]);
+  fillChoices($('reviewKey'), [['Use scan key', '__scan__'], ...savedKeys.map((key) => [key, key])]);
   fillChoices($('repairModel'), [['Use scan model', '__scan__'], ['Codex default', ''], ...savedModels.map((model) => [modelLabel(model), model])]);
   fillChoices($('repairKey'), [['Use scan key', '__scan__'], ...savedKeys.map((key) => [key, key])]);
   for (const prefix of ['scan', 'job']) {
@@ -109,6 +111,8 @@ function renderWorkflowOverview(scan) {
     workflowRunner?.available ? 'Isolated runner ready' : 'Runner availability pending']) {
     if (value) bar.append(node('span', 'overview-chip', value));
   }
+  if (scan.review_progress && scan.status === 'reviewing') bar.append(node('span', 'overview-chip', scan.review_progress));
+  if (scan.status === 'complete' && !scan.accuracy_version) bar.append(node('span', 'overview-chip', 'Historical scan · fresh source investigation required'));
   const operation = scan.operation;
   $('operationStatus').classList.toggle('hidden', !operation || operation.status === 'complete');
   if (operation) {
@@ -121,11 +125,12 @@ function renderWorkflowOverview(scan) {
   if (!coverage) panel.append(node('p', 'field-help', 'Coverage was not recorded for this older scan. Run a fresh review to record it.'));
   else {
     panel.append(node('p', 'field-help', coverage.meaning));
-    panel.append(node('p', 'field-help', `Context ${coverage.characters.toLocaleString()} / ${coverage.character_limit.toLocaleString()} characters. Files provided to the model are recorded below.`));
+    panel.append(node('p', 'field-help', coverage.cumulative_requests ? `${coverage.characters.toLocaleString()} source characters requested across rounds · ${coverage.character_limit.toLocaleString()} context character budget per request.` : `Context ${coverage.characters.toLocaleString()} / ${coverage.character_limit.toLocaleString()} characters. Files provided to the model are recorded below.`));
     if (scan.comparison) {
       panel.append(node('p', '', `Compared ${scan.comparison.base_commit.slice(0, 8)} with ${(scan.commit || '').slice(0, 8)}. ${scan.comparison.changed_files.length} tracked files changed.`));
       if (scan.comparison.not_reported_again?.length) panel.append(node('p', 'field-help', `${scan.comparison.not_reported_again.length} previous candidates were not reported again. This is not a verified fix.`));
     }
+    if (scan.analysis_tools) panel.append(node('p', 'field-help', `Semgrep ${scan.analysis_tools.semgrep.status} · ${scan.analysis_tools.semgrep.reason || ''} · Imported/tool leads ${(scan.tool_leads || []).length}`));
     panel.append(table(['File', 'Coverage', 'Lines', 'Reason'], coverage.files.slice(0, 300).map((file) => [file.path, file.status, `${file.included_lines}/${file.total_lines ?? '?'}`, file.reason])));
     const download = node('button', 'secondary-button', 'Download full coverage JSON');
     download.type = 'button';
@@ -202,6 +207,8 @@ function appendFindingTools(card, finding, scan) {
     card.append(assessment);
   }
 
+  card.append(node('p', 'field-help', `Evidence status · ${finding.pr?.ready ? 'confirmed regression' : finding.accuracy_status || 'legacy unverified'} · Source review ${finding.source_review?.verdict || 'pending'} · Test meaning ${finding.regression_review?.verdict || 'pending'}`));
+  if (finding.regression_review?.reason) card.append(node('p', 'field-help', finding.regression_review.reason));
   const evidence = workflowSection(scan.id, finding.id, 'evidence', 'Source evidence & attack path');
   if (finding.evidence_view?.function) evidence.append(node('p', 'field-help', `Nearest function declaration: ${finding.evidence_view.function}`));
   evidence.append(node('pre', 'source-evidence', finding.evidence_view?.snippet || 'Source evidence unavailable'));
@@ -210,6 +217,7 @@ function appendFindingTools(card, finding, scan) {
     line.append(node('strong', '', step.label), node('p', '', step.text));
     evidence.append(line);
   }
+  for (const citation of finding.source_review?.citations || []) evidence.append(node('pre', 'source-evidence', `${citation.path}:${citation.line}\n${citation.quote}`));
   card.append(evidence);
 
   const triage = workflowSection(scan.id, finding.id, 'triage', `Decision · ${finding.triage?.decision || 'candidate'}`);
@@ -246,7 +254,7 @@ function appendFindingTools(card, finding, scan) {
     const section = workflowSection(scan.id, finding.id, 'plan', 'Review / edit patch and regression plan', true);
     section.append(node('p', 'field-help', 'Review the diff and command before verification. The runner has no network, credentials, or writable host checkout.'));
     const fields = {};
-    for (const [key, title] of [['fix_patch', 'Source patch'], ['test_patch', 'Regression-test patch'], ['command', 'Test command as an argument array'],
+    for (const [key, title] of [['fix_patch', 'Source patch'], ['test_patch', 'Regression-test patch'], ['runtime', 'Runtime (python, node, python-app, browser)'], ['command', 'Test command as an argument array'],
       ['failure_marker', 'Expected original-code failure marker'], ['success_marker', 'Expected patched-code success marker']]) {
       section.append(node('label', '', title));
       const input = node(key.endsWith('patch') ? 'textarea' : 'input', key.endsWith('patch') ? 'patch-editor' : 'workflow-input');
@@ -259,7 +267,7 @@ function appendFindingTools(card, finding, scan) {
     section.append(workflowButton('Save edited plan', async () => {
       try {
         const changed = { ...plan, fix_patch: fields.fix_patch.value, test_patch: fields.test_patch.value,
-          command: JSON.parse(fields.command.value), failure_marker: fields.failure_marker.value, success_marker: fields.success_marker.value };
+          runtime: fields.runtime.value, command: JSON.parse(fields.command.value), failure_marker: fields.failure_marker.value, success_marker: fields.success_marker.value };
         const saved = await findingAction(scan, finding, 'plan', { plan: changed });
         if (saved) findingDrafts.delete(draftKey);
       } catch (error) { toast(error.message); }
@@ -334,6 +342,12 @@ function initializeWorkflowUI() {
     } catch (error) { toast(error.message); }
   });
   renderWorkflowChoices();
+  api('/api/accuracy').then(({ benchmark }) => {
+    if (!benchmark) return;
+    const percent = (value) => value == null ? 'undefined' : `${(value * 100).toFixed(1)}%`;
+    const metrics = benchmark.metrics;
+    $('accuracyBenchmark').textContent = `Synthetic benchmark · ${benchmark.cases} cases · ${benchmark.model} · Precision ${percent(metrics.precision)} · Recall ${percent(metrics.recall)} · Decision coverage ${percent(metrics.decision_coverage)}. Small fixture results do not establish bounty accuracy.`;
+  }).catch(() => {});
   api('/api/runner').then((result) => {
     workflowRunner = result;
     if (activeScan) renderWorkflowOverview(activeScan);

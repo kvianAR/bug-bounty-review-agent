@@ -235,3 +235,22 @@ test('finding workflow exposes evidence, repair and complete PR copy controls', 
   await copy.listeners.click();
   assert.equal(app.clipboard[0], candidate.pr.body);
 });
+
+test('scan submits separate reviewer and optional analyzer evidence', async () => {
+  const app = await harness();
+  app.get('repoUrl').value = 'https://github.com/owner/A';
+  app.get('reviewModel').value = 'openrouter|fixture/reviewer:free';
+  app.get('reviewKey').value = 'review-key';
+  app.get('useSemgrep').checked = true;
+  app.get('analysisSarif').files = [{ size: 100, text: async () => JSON.stringify({ version: '2.1.0', runs: [] }) }];
+  let sent;
+  app.setFetch(async (url, options) => {
+    if (options.method === 'POST') { sent = JSON.parse(options.body); return response(job('A')); }
+    return response(url === '/api/scans' ? { scans: [] } : job('A'));
+  });
+  await app.get('scanForm').listeners.submit({ preventDefault() {} });
+  assert.equal(sent.review_model, 'openrouter|fixture/reviewer:free');
+  assert.equal(sent.review_key, 'review-key');
+  assert.equal(sent.use_semgrep, true);
+  assert.equal(sent.analysis_sarif.version, '2.1.0');
+});

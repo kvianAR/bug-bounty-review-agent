@@ -136,6 +136,8 @@ class CoreTests(unittest.TestCase):
         repo = self.folder / "repo"
         repo.mkdir()
         (repo / "app.py").write_text("line one\n")
+        subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
         (repo / "outside.py").symlink_to(self.folder / "private.py")
         (self.folder / "private.py").write_text("private\n")
         data = report([finding(), finding(path="../private.py"), finding(path="outside.py"),
@@ -162,6 +164,8 @@ class CoreTests(unittest.TestCase):
         repo = self.folder / "repo"
         repo.mkdir()
         (repo / "app.py").write_text("line one\n")
+        subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
         url = "https://github.com/owner/repository"
         job = {"id": "fixture", "url": url, "focus": "auth", "model": "openrouter|vendor/model:free",
                "key_alias": "key", "status": "queued", "messages": []}
@@ -170,8 +174,8 @@ class CoreTests(unittest.TestCase):
         server.save(job)
         coverage = {"totals": {"included": 1, "partial": 0, "skipped": 0}, "files": [], "characters": 14, "character_limit": 65000}
         with mock.patch.object(server, "resolve_repo", return_value=(repo, url)), \
-             mock.patch.object(server.workflow, "coverage_context", return_value=("SOURCE_EXCERPT", coverage)), \
-             mock.patch.object(server, "custom_completion", return_value=json.dumps(report())), \
+             mock.patch.object(server.workflow, "tracked_files", return_value=["app.py"]), \
+             mock.patch.object(server, "custom_completion", side_effect=lambda model, key, messages, *args, **kwargs: json.dumps({"requests": [], "notes": "fixture"} if "Investigate an authorized" in messages[0]["content"] else report())), \
              mock.patch.object(server.workflow, "git", return_value=SimpleNamespace(returncode=0, stdout="commit")):
             server.run_scan("fixture")
         self.assertEqual("complete", job["status"])

@@ -25,7 +25,8 @@ SOURCE_SUFFIXES = {".py", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", 
                    ".rb", ".php", ".sh", ".json", ".yaml", ".yml", ".toml", ".c", ".cpp", ".h", ".hpp",
                    ".swift", ".cs", ".kt", ".sql", ".html", ".vue", ".svelte", ".tf", ".xml", ".proto", ".ini", ".cfg"}
 EXCLUDED_PARTS = {"node_modules", "vendor", "dist", "build", ".git", "__pycache__", ".venv", "venv", ".next", "coverage", "test-results"}
-RUNTIME_IMAGES = {"python": "python:3.12-alpine", "node": "node:22-alpine"}
+RUNTIME_IMAGES = {"python": "python:3.12-alpine", "node": "node:22-alpine",
+                  "python-app": "trace-python-review:latest", "browser": "trace-browser-review:latest"}
 MAX_PATCH_BYTES = 200_000
 MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 
@@ -305,7 +306,8 @@ def parse_plan(text, repo=None):
     if plan.get("runtime") not in RUNTIME_IMAGES:
         raise ValueError("Choose the Python or Node isolated runtime")
     command = plan.get("command")
-    allowed = {"python": {"python", "python3"}, "node": {"node", "npm"}}
+    allowed = {"python": {"python", "python3"}, "python-app": {"python", "python3"},
+               "node": {"node", "npm"}, "browser": {"node"}}
     if (not isinstance(command, list) or not 1 <= len(command) <= 20
             or not all(isinstance(arg, str) and 0 < len(arg) <= 500 and "\0" not in arg for arg in command)
             or command[0] not in allowed[plan["runtime"]]):
@@ -428,18 +430,22 @@ def runner_status():
         return {"available": False, "reason": "Docker did not respond", "images": {}}
 
 
-def run_container(snapshot, plan, image_id, timeout=40):
+def run_container(snapshot, plan, image_id, timeout=40, redact_output=True):
     environment = docker_environment()
     name = "trace-verify-" + uuid.uuid4().hex[:16]
     user = str(os.getuid()) if hasattr(os, "getuid") else "1000"
     group = str(os.getgid()) if hasattr(os, "getgid") else "1000"
+    browser = plan.get("runtime") == "browser"
+    memory = "1024m" if browser else "512m"
+    file_limit = "67108864" if browser else "8388608"
+    temporary_size = "128m" if browser else "32m"
     command = ["docker", "run", "--pull", "never", "--name", name, "--network", "none", "--read-only",
                "--user", user + ":" + group, "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-               "--pids-limit", "64", "--memory", "512m", "--memory-swap", "512m", "--cpus", "1",
-               "--ulimit", "nofile=128:128", "--ulimit", "fsize=8388608:8388608", "--log-driver", "none",
+               "--pids-limit", "128" if browser else "64", "--memory", memory, "--memory-swap", memory, "--cpus", "1",
+               "--ulimit", "nofile=256:256", "--ulimit", "fsize={}:{}".format(file_limit, file_limit), "--log-driver", "none",
                "--mount", "type=bind,source={},target=/input,readonly".format(snapshot),
                "--tmpfs", "/workspace:rw,size=128m,uid={},gid={}".format(user, group),
-               "--tmpfs", "/tmp:rw,size=32m,uid={},gid={}".format(user, group), "--workdir", "/workspace",
+               "--tmpfs", "/tmp:rw,size={},uid={},gid={}".format(temporary_size, user, group), "--shm-size", "128m" if browser else "64m", "--workdir", "/workspace",
                "--env", "HOME=/tmp", "--env", "LANG=C.UTF-8", "--env", "CI=true",
                "--entrypoint", "/bin/sh", image_id, "-c",
                'cp -R /input/. /workspace/ && exec timeout -s KILL 40 "$@"', "trace-regression"] + plan["command"]
@@ -475,7 +481,7 @@ def run_container(snapshot, plan, image_id, timeout=40):
             reader.join(timeout=2)
             process.stdout.close()
     return {"exit_code": process.returncode, "timed_out": timed_out,
-            "output": redact_source(output.decode(errors="replace")), "output_truncated": total[0] > len(output),
+            "output": redact_source(output.decode(errors="replace")) if redact_output else output.decode(errors="replace"), "output_truncated": total[0] > len(output),
             "duration_seconds": round(time.monotonic() - started, 2), "image_id": image_id}
 
 
@@ -497,14 +503,14 @@ def verify_plan(repo, plan):
         before = run_container(baseline, plan, runtime["id"])
         after = run_container(patched, plan, runtime["id"])
     result = {"baseline": before, "patched": after, "command": plan["command"],
-              "limits": {"network": "none", "memory_mb": 512, "cpus": 1, "pids": 64, "workspace_mb": 128, "seconds_per_run": 40}}
+              "limits": {"network": "none", "memory_mb": 1024 if plan["runtime"] == "browser" else 512, "cpus": 1, "pids": 128 if plan["runtime"] == "browser" else 64, "workspace_mb": 128, "seconds_per_run": 40}}
     if before["timed_out"] or after["timed_out"]:
         result.update(status="blocked", reason="Regression exceeded the isolated-run deadline")
     elif before["exit_code"] != 0 and plan["failure_marker"] in before["output"] and after["exit_code"] == 0 and plan["success_marker"] in after["output"]:
         result.update(status="reproduced", reason="Regression failed on the original code and passed with the proposed fix. Review the test's meaning before disclosure.")
     elif before["exit_code"] == 0:
         result.update(status="not_reproduced", reason="The regression did not fail on the original code")
-    elif after["exit_code"] != 0:
+    elif after["exit_code"] != 0 and plan["failure_marker"] in after["output"]:
         result.update(status="fix_failed", reason="The proposed fix did not pass the regression")
     else:
         result.update(status="blocked", reason="Expected regression markers were missing. Check dependencies and the test plan.")
@@ -516,6 +522,8 @@ def pr_document(job, finding):
     verification = finding.get("verification") or {"status": "not_run"}
     title = plan.get("pr_title") or "Fix: " + finding["title"]
     ready = bool(plan.get("valid") and verification.get("status") == "reproduced"
+                 and finding.get("source_review", {}).get("verdict") == "supported"
+                 and finding.get("regression_review", {}).get("verdict") == "supported"
                  and (finding.get("assessment") or {}).get("verdict") not in {"rejected", "needs_validation"}
                  and (finding.get("triage") or {}).get("decision") not in {"dismissed", "rejected"})
     command = shlex.join(plan.get("command", [])) or "Verification command pending"
@@ -525,6 +533,10 @@ def pr_document(job, finding):
              "- Classification {}".format(finding["cwe"]), "", finding["evidence"],
              "", "## Reproduction", "", finding["reproduction"], "", "```sh", command, "```", "", "## Verification", "",
              "Status: {}".format(verification["status"]), "", verification.get("reason", "Execution pending. This report currently contains source-review evidence only.")]
+    lines.extend(["", "## Security evidence gate", "",
+                  "Source review: " + finding.get("source_review", {}).get("verdict", "pending"),
+                  "Regression meaning review: " + finding.get("regression_review", {}).get("verdict", "pending"),
+                  finding.get("regression_review", {}).get("reason", "Review the real entry point and authorization before submission.")])
     if finding.get("assessment"):
         lines.extend(["", "## Candidate assessment", "", finding["assessment"].get("verdict", "pending"),
                       "", finding["assessment"].get("reason", "")])

@@ -1,0 +1,27 @@
+rules:
+  - id: python-shell-user-input-lead
+    languages: [python]
+    severity: WARNING
+    message: Shell execution needs an input and reachability review.
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.run(..., shell=True, ...)
+          - pattern: subprocess.Popen(..., shell=True, ...)
+          - pattern: os.system(...)
+  - id: python-dynamic-evaluation-lead
+    languages: [python]
+    severity: WARNING
+    message: Dynamic evaluation needs a trust-boundary review.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+  - id: javascript-dynamic-evaluation-lead
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Dynamic evaluation needs an input and reachability review.
+    pattern: eval(...)
+  - id: python-disabled-tls-verification-lead
+    languages: [python]
+    severity: WARNING
+    message: Disabled TLS verification needs deployment and caller review.
+    pattern: requests.$METHOD(..., verify=False, ...)
