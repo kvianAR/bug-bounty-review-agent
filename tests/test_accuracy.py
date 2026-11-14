@@ -24,6 +24,16 @@ class AccuracyTests(unittest.TestCase):
         self.repository = accuracy.Repository(self.root, 10000)
         self.repository.manifest()
 
+    def test_request_local_error_cannot_be_supported_security_impact(self):
+        self.repository.read('service.py', 301, 302)
+        value = {'verdict': 'supported', 'reason': 'A malformed request fails.',
+                 'attacker': 'authenticated user', 'entry_point': 'route',
+                 'violated_control': 'error handling', 'unauthorized_effect': 'HTTP 500 for the malformed request',
+                 'security_effect': 'service_outage', 'impact_scope': 'single_request',
+                 'citations': [{'path': 'service.py', 'line': 302, 'quote': 'name.strip()[:120]'}]}
+        result = accuracy.check_assessment(self.repository, json.dumps(value))
+        self.assertEqual('hardening', result['verdict'])
+
     def test_prose_navigation_reply_does_not_approve_a_finding(self):
         value = accuracy.investigation_response("No more source requests needed.")
         self.assertEqual([], value['requests'])
