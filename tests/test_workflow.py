@@ -93,7 +93,7 @@ class WorkflowTests(unittest.TestCase):
                  "commit": self.commit, "status": "complete", "created_at": "2026-11-09T00:00:00+00:00",
                  "messages": [], "report": report([item]), "model": "openrouter|fixture/primary:free",
                  "key_alias": "primary", "policy": workflow.budget_policy({"max_cost_usd": 0})}
-        item["source_review"] = {"verdict": "supported", "reason": "Fixture public path reaches the file helper"}
+        item["source_review"] = {"verdict": "supported", "reason": "Fixture public path reaches the file helper", "security_effect": "unauthorized_read", "impact_scope": "other_principal", "attacker": "unprivileged user", "entry_point": "read_note", "violated_control": "notes root containment", "unauthorized_effect": "read outside notes root", "citations": [{"path": "storage.py", "line": 4, "quote": "return"}]}
         item["regression_review"] = {"verdict": "supported", "reason": "Fixture test exercises the real helper"}
         server.JOBS[value["id"]] = value
         server.KEYS["primary"] = "dummy-primary-key"

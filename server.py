@@ -377,9 +377,8 @@ def run_workflow(job_id, finding_id, action, model, key_alias):
                           "reason": plan.get("reason") or plan.get("security_boundary", "Candidate requires owner review")}
             update = {"remediation": plan, "assessment": assessment, "verification": {"status": "not_run"}}
         else:
-            source_review = finding.get("source_review", {})
             regression_review = {"verdict": "needs_validation", "reason": "Run a fresh investigative scan to establish the source security boundary."}
-            if source_review.get("verdict") == "supported":
+            if workflow.source_supported(finding):
                 def call(phase, messages, validator):
                     return execute_model(job_id, phase, messages,
                                          job.get("review_model", job["model"]),

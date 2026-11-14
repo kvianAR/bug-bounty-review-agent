@@ -517,12 +517,25 @@ def verify_plan(repo, plan):
     return result
 
 
+def source_supported(finding):
+    source = finding.get("source_review", {})
+    effect = source.get("security_effect")
+    scope = source.get("impact_scope")
+    return bool(source.get("verdict") == "supported" and source.get("citations")
+                and all(isinstance(source.get(field), str) and source[field].strip()
+                        for field in ("attacker", "entry_point", "violated_control", "unauthorized_effect"))
+                and effect in {"unauthorized_read", "unauthorized_write", "privilege_escalation", "code_execution",
+                               "credential_disclosure", "service_outage", "script_execution"}
+                and scope in {"other_principal", "shared_service", "cross_origin"}
+                and (effect != "service_outage" or scope == "shared_service"))
+
+
 def pr_document(job, finding):
     plan = finding.get("remediation") or {}
     verification = finding.get("verification") or {"status": "not_run"}
     title = plan.get("pr_title") or "Fix: " + finding["title"]
     ready = bool(plan.get("valid") and verification.get("status") == "reproduced"
-                 and finding.get("source_review", {}).get("verdict") == "supported"
+                 and source_supported(finding)
                  and finding.get("regression_review", {}).get("verdict") == "supported"
                  and (finding.get("assessment") or {}).get("verdict") not in {"rejected", "needs_validation"}
                  and (finding.get("triage") or {}).get("decision") not in {"dismissed", "rejected"})
